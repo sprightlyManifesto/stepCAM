@@ -1,0 +1,37 @@
+add a tab called "step milling"
+
+add the same 3d preview as threadmilling
+add a import button for a user to select and open a step into the interface
+
+the user should be able to right click
+    closed loops of edges
+    touching but unclosed groups of edges
+    flat surfaces
+
+a clicked edge will be indicated in the gui by a change in its colour,  that will be removed when escape is pressed or anonther item is selected.
+
+each right clicked option will add an operation to a list of operations
+
+for flat surfaces normal to Z the options will be
+
+    Face
+    Pocket
+
+Face, will mill the whole part down to the level of the surface,  
+including an overlap outside the part,  in the list it will have options for tool selection
+stepover percentage, depth per pass.
+
+Pocket, will cut just the material down to the face inside the lines defining the surface,  omiting any internal loops.
+options[ include, ]stepover, Feed (default 500),Speed (default 12000),Ramp angle (default 3) ,Start Z (default 0), depth per pass (default 1mm), finish path (default 0.2mm)]  
+all final faces will be climb milled by default.
+pocket will have a drop down for stratergy (standard or Adaptive clearing) Adaptive clearing will use trocrodal machining to remove the material.
+in both stratergy the a small amount of material willl be left on all the outer walls of the pocket and then mahcined of in a finishing pass.
+pocket will have another drop down for entry style options [helix, zigzag, plunge]
+
+for all types of edges there will be an option:
+    add mill tab
+
+add mill tab add a item to the list and display with the parameter Zheight,  width,  depth,  the mill tab is a rectangle extruded up from the edge by Zheight.  
+the width is inline with the edge or in the case of a curved edge tangent to it at the point clicked. 
+
+in gcode generation the cutter will lift up and over any area of a mill tab.

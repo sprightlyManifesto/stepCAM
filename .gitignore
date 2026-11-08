@@ -1,0 +1,26 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Generated G-code output (test files live in testdata/)
+/*.nc
+/*.ngc
+/*.gcode
+/*.tap
+
+# Python (testdata/make_step.py)
+__pycache__/
+*.py[cod]
+.venv/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

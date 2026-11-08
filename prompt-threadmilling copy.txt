@@ -1,0 +1,32 @@
+write a rust app called GWIZ
+that creates gcode programs to mill holes via helical plunging then change tool and thread them.
+
+the app will have a tab called thread milling
+it will have a table called thread locations  in which there will be groups
+
+each group will have:
+    -a  list of x,y locations
+    -a thread drop down containing metric thread M2 to M6
+    -a thread lenght numeric control from from 0-100mm (float)
+    -a miling cutter selector containing a list of cutters 1x3,1.5.x6,2x12,3x17,3.175x17
+
+the hole diameter that needs to be milled for each thread size are:
+M2 = 1.6
+M2.5 = 2.05
+M3 = 2.5
+M4 = 3.3
+M5 = 4.2
+M6 = 5.0
+
+the pitch of the threads are:
+
+M2 = 0.4
+M2.5 = 0.45
+M3 = 0.5
+M4 = 0.7
+M5 = 0.8
+M6 = 1.0
+
+the milling tool must be smaller than this diameter.
+threads are milled up from the bottom of the hole.
+thread must stop one pitch above the bottom of the hole.
