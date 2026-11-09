@@ -1,0 +1,4 @@
+add a right click option to faces to engrave text
+this adds an engrave item to the list , with a text box
+height ,depth, tool select,  font select,  radio buttons for left, center,and right align
+and x,y from the origin face center and radio boxes for top center and bottom vertical alignemnt

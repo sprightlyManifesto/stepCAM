@@ -5,9 +5,11 @@ edition = "2021"
 description = "stepCAM - G-code generator for helical hole boring and thread milling"
 
 [dependencies]
+ab_glyph = "0.2"
 cavalier_contours = "0.9"
 earcutr = "0.5"
 eframe = "0.29"
+epaint_default_fonts = "0.29"
 geo = "0.29"
 rfd = "0.18"
 serde = { version = "1", features = ["derive"] }

@@ -3,7 +3,9 @@
 //! Supports B-rep faces (ADVANCED_FACE / FACE_SURFACE) bounded by EDGE_LOOPs
 //! of EDGE_CURVEs whose geometry is LINE, CIRCLE, ELLIPSE, B_SPLINE_CURVE
 //! (incl. rational), or SURFACE_CURVE/SEAM_CURVE wrapping those. Planar faces
-//! are triangulated for display/picking; other faces show their edges only.
+//! are triangulated directly; cylindrical, conical, spherical, toroidal and
+//! B-spline faces are tessellated through their surface parameters
+//! (`surface.rs`); other faces show their edges only.
 //! Free wire geometry (unused EDGE_CURVEs, POLYLINEs and TRIMMED_CURVEs in
 //! GEOMETRIC_(CURVE_)SETs) becomes free edges. Assembly transforms are ignored.
 
@@ -326,6 +328,25 @@ pub struct Face {
     pub origin: P3,
     pub loops: Vec<Loop>,
     pub tris: Vec<[P3; 3]>,
+    /// Cylindrical faces: the cylinder.
+    pub cyl: Option<Cyl>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cyl {
+    /// A point on the axis and the axis direction.
+    pub origin: P3,
+    pub axis: P3,
+    pub r: f64,
+    /// Material outside the cylinder (a hole), not inside (a boss).
+    pub hole: bool,
+}
+
+impl Cyl {
+    /// Axis parallel to Z.
+    pub fn vertical(&self) -> bool {
+        self.axis[2].abs() > 0.9999
+    }
 }
 
 impl Face {
@@ -356,6 +377,8 @@ pub struct Model {
 struct Ctx<'a> {
     e: &'a HashMap<u64, Ent>,
     scale: f64,
+    /// Plane angle unit in radians (1, or pi/180 for degrees).
+    angle: f64,
 }
 
 impl<'a> Ctx<'a> {
@@ -402,6 +425,109 @@ impl<'a> Ctx<'a> {
         // make x orthogonal to z
         x = unit(sub(x, mul(z, dot(x, z))));
         Some((o, z, x))
+    }
+
+    /// Curved surface geometry (None for planes and unsupported surfaces).
+    fn surface(&self, ent: &Ent) -> Option<crate::surface::Surf> {
+        use crate::surface::{BSpline, Frame, Surf};
+        let a = ent.args();
+        let frame = || {
+            let (o, z, x) = self.placement(a.get(1)?.as_ref()?)?;
+            Some(Frame { o, x, y: cross(z, x), z })
+        };
+        let num = |k: usize| a.get(k).and_then(|v| v.as_num());
+        match ent.name() {
+            "CYLINDRICAL_SURFACE" => Some(Surf::Cylinder { f: frame()?, r: num(2)? * self.scale }),
+            "CONICAL_SURFACE" => Some(Surf::Cone { f: frame()?, r: num(2)? * self.scale, tan: (num(3)? * self.angle).tan() }),
+            "SPHERICAL_SURFACE" => Some(Surf::Sphere { f: frame()?, r: num(2)? * self.scale }),
+            "TOROIDAL_SURFACE" => Some(Surf::Torus { f: frame()?, major: num(2)? * self.scale, minor: num(3)? * self.scale }),
+            "SURFACE_OF_LINEAR_EXTRUSION" => {
+                let (pts, closed) = self.curve_samples(a.get(1)?.as_ref()?)?;
+                let d = self.dir(a.get(2)?.as_ref()?)?;
+                Some(Surf::Extrusion { pts, closed, d })
+            }
+            _ if ent.has("B_SPLINE_SURFACE_WITH_KNOTS") || ent.has("B_SPLINE_SURFACE") => {
+                // simple: B_SPLINE_SURFACE_WITH_KNOTS(name, ud, vd, pts, form, uc, vc, si, um, vm, uk, vk, spec)
+                // complex: B_SPLINE_SURFACE(ud, vd, pts, form, uc, vc, si) + ..._WITH_KNOTS(um, vm, uk, vk, spec)
+                let (b, k): (Vec<&Val>, Vec<&Val>) = if let Some(bs) = ent.part("B_SPLINE_SURFACE") {
+                    let k = ent.part("B_SPLINE_SURFACE_WITH_KNOTS")?;
+                    (bs.iter().collect(), k.iter().collect())
+                } else {
+                    (a.iter().skip(1).take(7).collect(), a.iter().skip(8).collect())
+                };
+                let deg = |v: &Val| v.as_num().map(|d| d as usize);
+                let (udeg, vdeg) = (deg(b.first()?)?, deg(b.get(1)?)?);
+                let pts: Vec<Vec<P3>> = b.get(2)?.as_list().iter().map(|row| row.as_list().iter().filter_map(|r| r.as_ref()).filter_map(|r| self.point(r)).collect()).collect();
+                let weights: Option<Vec<Vec<f64>>> = ent
+                    .part("RATIONAL_B_SPLINE_SURFACE")
+                    .and_then(|w| w.first())
+                    .map(|l| l.as_list().iter().map(|row| row.as_list().iter().filter_map(|v| v.as_num()).collect()).collect());
+                let ctrl: Vec<Vec<[f64; 4]>> = pts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        row.iter()
+                            .enumerate()
+                            .map(|(j, p)| {
+                                let w = weights.as_ref().and_then(|w| w.get(i)?.get(j).copied()).unwrap_or(1.0);
+                                [p[0] * w, p[1] * w, p[2] * w, w]
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let kv = |m: &Val, k: &Val| {
+                    let mut v = vec![];
+                    for (m, k) in m.as_list().iter().zip(k.as_list()) {
+                        for _ in 0..m.as_num().unwrap_or(1.0) as usize {
+                            v.push(k.as_num().unwrap_or(0.0));
+                        }
+                    }
+                    v
+                };
+                let bs = BSpline {
+                    udeg,
+                    vdeg,
+                    ctrl,
+                    ukv: kv(k.first()?, k.get(2)?),
+                    vkv: kv(k.get(1)?, k.get(3)?),
+                    uclosed: b.get(4).and_then(|v| v.as_bool()).unwrap_or(false),
+                    vclosed: b.get(5).and_then(|v| v.as_bool()).unwrap_or(false),
+                };
+                bs.is_valid().then_some(Surf::BSpline(bs))
+            }
+            _ => None,
+        }
+    }
+
+    /// A whole curve as a polyline, and whether it is closed (circles,
+    /// ellipses and B-splines; lines have no extent of their own).
+    fn curve_samples(&self, id: u64) -> Option<(Vec<P3>, bool)> {
+        let ent = self.get(self.base_curve(id)?)?;
+        let (mut pts, closed) = match ent.name() {
+            "CIRCLE" | "ELLIPSE" => {
+                let args = ent.args();
+                let (o, z, x) = self.placement(args.get(1)?.as_ref()?)?;
+                let y = cross(z, x);
+                let r1 = args.get(2)?.as_num()? * self.scale;
+                let r2 = if ent.name() == "ELLIPSE" { args.get(3)?.as_num()? * self.scale } else { r1 };
+                let n = 144;
+                let v = (0..n).map(|k| {
+                    let t = std::f64::consts::TAU * k as f64 / n as f64;
+                    add(o, add(mul(x, r1 * t.cos()), mul(y, r2 * t.sin())))
+                });
+                (v.collect(), true)
+            }
+            _ if ent.has("B_SPLINE_CURVE_WITH_KNOTS") || ent.has("B_SPLINE_CURVE") => {
+                let v = self.bspline_samples(ent);
+                let closed = v.len() > 2 && dist(v[0], *v.last().unwrap()) < 1e-6;
+                (v, closed)
+            }
+            _ => return None,
+        };
+        if closed && pts.len() > 1 && dist(pts[0], *pts.last().unwrap()) < 1e-6 {
+            pts.pop();
+        }
+        (pts.len() >= 2).then_some((pts, closed))
     }
 
     /// Unwrap SURFACE_CURVE / SEAM_CURVE to their 3D curve.
@@ -579,6 +705,20 @@ fn sub_range(s: &[P3], a: P3, b: P3, forward: bool, closed: bool) -> Vec<P3> {
     }
 }
 
+/// Plane angle unit in radians: degrees when declared as a conversion-based unit.
+fn angle_unit(e: &HashMap<u64, Ent>) -> f64 {
+    for ent in e.values() {
+        if ent.has("PLANE_ANGLE_UNIT") && ent.has("CONVERSION_BASED_UNIT") {
+            if let Some(Val::Str(n)) = ent.part("CONVERSION_BASED_UNIT").and_then(|c| c.first()) {
+                if n.to_ascii_uppercase().contains("DEG") {
+                    return std::f64::consts::PI / 180.0;
+                }
+            }
+        }
+    }
+    1.0
+}
+
 fn length_unit_scale(e: &HashMap<u64, Ent>) -> f64 {
     for ent in e.values() {
         if ent.has("LENGTH_UNIT") {
@@ -636,7 +776,7 @@ pub fn load(path: &str) -> Result<Model, String> {
 
 pub fn parse_model(src: &str) -> Result<Model, String> {
     let ents = parse_entities(src)?;
-    let ctx = Ctx { e: &ents, scale: length_unit_scale(&ents) };
+    let ctx = Ctx { e: &ents, scale: length_unit_scale(&ents), angle: angle_unit(&ents) };
     let mut model = Model { unit_scale: ctx.scale, ..Default::default() };
     let mut edge_idx: HashMap<u64, usize> = HashMap::new();
 
@@ -655,9 +795,12 @@ pub fn parse_model(src: &str) -> Result<Model, String> {
         let plane = surf.filter(|s| s.name() == "PLANE").and_then(|s| s.args().get(1)?.as_ref()).and_then(|r| ctx.placement(r));
         let face_index = model.faces.len();
         let mut loops = Vec::new();
+        // loop points in the direction the bound runs round the face
+        let mut sensed: Vec<Vec<P3>> = Vec::new();
         for b in a.get(1).map(|v| v.as_list()).unwrap_or(&[]) {
             let Some(bent) = b.as_ref().and_then(|r| ctx.get(r)) else { continue };
             let outer = bent.name() == "FACE_OUTER_BOUND";
+            let bound_sense = bent.args().get(2).and_then(|v| v.as_bool()).unwrap_or(true);
             let Some(lent) = bent.args().get(1).and_then(|v| v.as_ref()).and_then(|r| ctx.get(r)) else { continue };
             if lent.name() != "EDGE_LOOP" {
                 continue;
@@ -688,6 +831,11 @@ pub fn parse_model(src: &str) -> Result<Model, String> {
                 lp.pts.pop();
             }
             if !lp.edges.is_empty() {
+                let mut sp = lp.pts.clone();
+                if !bound_sense {
+                    sp.reverse();
+                }
+                sensed.push(sp);
                 loops.push(lp);
             }
         }
@@ -705,8 +853,19 @@ pub fn parse_model(src: &str) -> Result<Model, String> {
                 loops[best].outer = true;
             }
         }
-        let tris = if planar { triangulate(&loops, normal) } else { vec![] };
-        model.faces.push(Face { planar, normal, origin, loops, tris });
+        let curved = if planar { None } else { surf.and_then(|s| ctx.surface(s)) };
+        let tris = if planar {
+            triangulate(&loops, normal)
+        } else {
+            curved.as_ref().map(|s| crate::surface::tessellate(s, &sensed, same_sense)).unwrap_or_default()
+        };
+        // the surface normal of a cylinder points away from the axis; the face
+        // normal points out of the material, so a hole has them opposed
+        let cyl = match &curved {
+            Some(crate::surface::Surf::Cylinder { f, r }) => Some(Cyl { origin: f.o, axis: f.z, r: *r, hole: !same_sense }),
+            _ => None,
+        };
+        model.faces.push(Face { planar, normal, origin, loops, tris, cyl });
     }
 
     // free edges: EDGE_CURVEs not used by a face
@@ -859,6 +1018,10 @@ impl Model {
             }
             for t in &mut f.tris {
                 t.iter_mut().for_each(pt);
+            }
+            if let Some(c) = &mut f.cyl {
+                c.origin = pl.point(c.origin);
+                c.axis = pl.dir(c.axis);
             }
         }
         (m.min, m.max) = bbox(&m);

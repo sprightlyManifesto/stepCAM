@@ -247,6 +247,25 @@ fn thread_hole(w: &mut Writer, s: &Settings, g: &ThreadGroup, tm: &ThreadMill, c
     w.line(format!("G0 Z{}", fmt(clear)));
 }
 
+/// Helical boring of every location (no tool change), for other programs.
+pub fn bore_code(s: &Settings, g: &ThreadGroup, locs: &[(f64, f64)]) -> String {
+    let mut w = Writer { out: String::new(), current_tool: None };
+    for &(x, y) in locs {
+        bore_hole(&mut w, s, g, x, y);
+    }
+    w.out
+}
+
+/// Thread milling of every location (no tool change), for other programs.
+pub fn thread_code(s: &Settings, g: &ThreadGroup, locs: &[(f64, f64)]) -> String {
+    let mut w = Writer { out: String::new(), current_tool: None };
+    let tm = s.thread_mill(g.thread);
+    for &(x, y) in locs {
+        thread_hole(&mut w, s, g, &tm, x, y);
+    }
+    w.out
+}
+
 /// Generate the full program. Returns the list of error messages if the job
 /// is invalid. Boring is done first (grouped by cutter), then threading
 /// (grouped by thread size), to minimise tool changes.

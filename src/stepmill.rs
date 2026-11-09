@@ -7,8 +7,9 @@
 //!   at each depth level cuts the walls to size.
 //! * Adaptive strategy = trochoidal loops along offset centre paths.
 
+use crate::engrave::{self, EngraveOp};
 use crate::gcode::fmt;
-use crate::model::{Cutter, Settings};
+use crate::model::{Cutter, Engraver, Settings};
 use cavalier_contours::polyline::*;
 use cavalier_contours::shape_algorithms::{Shape, ShapeOffsetOptions};
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,13 @@ pub struct PocketOp {
     /// Cut the walls to size in a final contour pass (false: the contour pass
     /// still runs but leaves `finish` on the walls - used by roughing).
     pub finish_pass: bool,
+    /// Sloped floor: triangles of the picked surface (empty = flat floor at `z`).
+    /// Each level clears where the surface is below it, cutting the walls to
+    /// that slice of the surface.
+    pub floor: Vec<[P3; 3]>,
+    /// Lowest Z of each island loop (sloped floors: an ignored island is
+    /// cleared from the levels at or below its lowest point).
+    pub islands_z: Vec<f64>,
 }
 
 impl Default for PocketOp {
@@ -117,6 +125,8 @@ impl Default for PocketOp {
             edges: vec![],
             edge_z: 0.0,
             finish_pass: true,
+            floor: vec![],
+            islands_z: vec![],
         }
     }
 }
@@ -128,6 +138,25 @@ pub struct RoughFace {
     pub z: f64,
     pub outer: Vec<P2>,
     pub holes: Vec<Vec<P2>>,
+    /// Sloped planar and curved faces: the surface triangles. Each layer
+    /// then protects only the part of the face above it, so roughing follows
+    /// the surface. Rebuilt from the model, not saved.
+    #[serde(skip)]
+    pub tris: Vec<[P3; 3]>,
+    /// `tris` are a curved surface (not one plane).
+    #[serde(skip)]
+    pub curved: bool,
+}
+
+impl RoughFace {
+    /// Lowest Z of the face (= `z` for flat and curved faces).
+    pub fn low(&self) -> f64 {
+        if self.tris.is_empty() {
+            self.z
+        } else {
+            self.tris.iter().flatten().map(|p| p[2]).fold(f64::INFINITY, f64::min)
+        }
+    }
 }
 
 /// Layer-by-layer roughing: at every layer the material inside the part
@@ -187,8 +216,10 @@ impl RoughOp {
 }
 
 /// Faces of a model as seen from above, for roughing. Planar faces facing
-/// up count at their Z, sloped / curved ones at their highest point
-/// (conservative); vertical and down-facing planar faces are skipped.
+/// up count at their Z, sloped planar and tessellated curved faces follow
+/// their surface (triangles), curved faces without a mesh count at their
+/// highest point (conservative); vertical and down-facing planar faces are
+/// skipped.
 pub fn rough_faces(model: &crate::step::Model) -> Vec<RoughFace> {
     let xy = |l: &crate::step::Loop| l.pts.iter().map(|p| [p[0], p[1]]).collect::<Vec<P2>>();
     let mut out = vec![];
@@ -198,16 +229,19 @@ pub fn rough_faces(model: &crate::step::Model) -> Vec<RoughFace> {
         }
         let Some(outer) = f.loops.iter().find(|l| l.outer).or(f.loops.first()) else { continue };
         let o = xy(outer);
-        if o.len() < 3 || signed_area(&o).abs() < 1e-6 {
-            continue; // seen edge-on
+        let curved = !f.planar && !f.tris.is_empty();
+        let seen = if curved { f.tris.iter().map(|t| tri_area(t)).sum::<f64>() } else if o.len() < 3 { 0.0 } else { signed_area(&o).abs() };
+        if seen < 1e-6 {
+            continue; // seen edge-on (vertical walls, cylinders standing up)
         }
         let z = if f.is_up_horizontal() {
             f.z()
         } else {
-            f.loops.iter().flat_map(|l| l.pts.iter()).map(|p| p[2]).fold(f64::NEG_INFINITY, f64::max)
+            f.loops.iter().flat_map(|l| l.pts.iter()).chain(f.tris.iter().flatten()).map(|p| p[2]).fold(f64::NEG_INFINITY, f64::max)
         };
         let holes = f.loops.iter().filter(|l| !std::ptr::eq(*l, outer)).map(xy).filter(|h| h.len() >= 3).collect();
-        out.push(RoughFace { z, outer: o, holes });
+        let tris = if !f.is_up_horizontal() { f.tris.clone() } else { vec![] };
+        out.push(RoughFace { z, outer: o, holes, tris, curved });
     }
     out
 }
@@ -313,6 +347,18 @@ pub enum OpKind {
     Tab(MillTab),
     Profile(ProfileOp),
     Rough(RoughOp),
+    Engrave(EngraveOp),
+    Thread(ThreadOp),
+}
+
+/// Thread milling of holes picked on the model: the same bore + thread
+/// cycle (and fields) as a group on the Thread Milling tab.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThreadOp {
+    /// Cylindrical hole faces the locations were taken from.
+    pub faces: Vec<usize>,
+    pub group: crate::model::ThreadGroup,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -327,7 +373,13 @@ impl StepOp {
             OpKind::Face(f) => format!("Face to Z{}", fmt(f.z)),
             OpKind::Pocket(p) => format!(
                 "Pocket{} to Z{} ({})",
-                if p.edges.is_empty() { "" } else { " (edges)" },
+                if !p.edges.is_empty() {
+                    " (edges)"
+                } else if !p.floor.is_empty() {
+                    " (sloped)"
+                } else {
+                    ""
+                },
                 fmt(p.z),
                 match p.strategy {
                     Strategy::Standard => "standard",
@@ -337,6 +389,16 @@ impl StepOp {
             OpKind::Tab(t) => format!("Mill tab at X{} Y{} Z{}", fmt(t.center[0]), fmt(t.center[1]), fmt(t.center[2])),
             OpKind::Profile(p) => format!("Profile {} to Z{}", p.side.name(), fmt(p.z)),
             OpKind::Rough(r) => format!("Rough to Z{} ({} mm layers)", fmt(r.final_z()), fmt(r.layer_height)),
+            OpKind::Engrave(e) => {
+                let first = e.text.lines().next().unwrap_or("");
+                let short: String = first.chars().take(20).collect();
+                let more = if first.chars().count() > 20 || e.text.trim_end().lines().count() > 1 { "…" } else { "" };
+                format!("Engrave \"{short}{more}\" {} deep at Z{}", fmt(e.depth), fmt(e.z))
+            }
+            OpKind::Thread(t) => {
+                let n = t.group.parse_locations().map(|l| l.len()).unwrap_or(0);
+                format!("Thread {} x{} - {} hole(s) from Z{}", t.group.thread.name(), fmt(t.group.thread.pitch()), n, fmt(t.group.start_z))
+            }
         }
     }
     /// Surface the op was made from (None for edge-based ops).
@@ -344,6 +406,7 @@ impl StepOp {
         match &self.kind {
             OpKind::Face(f) => Some(f.face_id),
             OpKind::Pocket(p) if p.edges.is_empty() => Some(p.face_id),
+            OpKind::Engrave(e) => Some(e.face_id),
             _ => None,
         }
     }
@@ -353,7 +416,28 @@ impl StepOp {
             OpKind::Pocket(p) => Some(&mut p.cutter),
             OpKind::Profile(p) => Some(&mut p.cutter),
             OpKind::Rough(r) => Some(&mut r.cutter),
+            OpKind::Engrave(e) => match &mut e.tool {
+                engrave::EngraveTool::EndMill(c) => Some(c),
+                engrave::EngraveTool::Bit(_) => None,
+            },
+            OpKind::Thread(t) => Some(&mut t.group.cutter),
             OpKind::Tab(_) => None,
+        }
+    }
+    /// Faces to highlight for the op.
+    pub fn faces(&self) -> Vec<usize> {
+        match &self.kind {
+            OpKind::Thread(t) => t.faces.clone(),
+            _ => self.face_id().into_iter().collect(),
+        }
+    }
+    pub fn engraver_mut(&mut self) -> Option<&mut Engraver> {
+        match &mut self.kind {
+            OpKind::Engrave(e) => match &mut e.tool {
+                engrave::EngraveTool::Bit(b) => Some(b),
+                engrave::EngraveTool::EndMill(_) => None,
+            },
+            _ => None,
         }
     }
     /// Edges the op was made from (empty for surface-based ops).
@@ -362,7 +446,7 @@ impl StepOp {
             OpKind::Pocket(p) => &p.edges,
             OpKind::Tab(t) => &t.edges,
             OpKind::Profile(p) => &p.edges,
-            OpKind::Face(_) | OpKind::Rough(_) => &[],
+            OpKind::Face(_) | OpKind::Rough(_) | OpKind::Engrave(_) | OpKind::Thread(_) => &[],
         }
     }
 }
@@ -469,7 +553,10 @@ pub fn offset_region(outer: &[P2], islands: &[Vec<P2>], d: f64) -> Vec<Vec<P2>> 
         plines.push(to_pline(isl, false));
     }
     let shape = Shape::from_plines(plines);
-    let off = shape.parallel_offset(d, &ShapeOffsetOptions::new());
+    // degenerate input can make the offsetter panic: treat as nothing left
+    let Ok(off) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shape.parallel_offset(d, &ShapeOffsetOptions::new()))) else {
+        return vec![];
+    };
     let mut out: Vec<Vec<P2>> = off.ccw_plines.iter().map(|ip| from_pline(&ip.polyline)).collect();
     if out.is_empty() {
         return vec![];
@@ -691,7 +778,171 @@ impl PocketCtx<'_> {
     }
 }
 
+/// Highest Z of a sloped pocket floor.
+pub fn floor_top(tris: &[[P3; 3]]) -> f64 {
+    tris.iter().flatten().map(|p| p[2]).fold(f64::NEG_INFINITY, f64::max)
+}
+
+/// Where a planar face (outline `outer` less `holes`, plane from `tris`) is
+/// at or below `z`, seen from above, plus the `extra` polygons: (outer, holes)
+/// regions.
+pub fn slice_below(outer: &[P2], holes: &[Vec<P2>], tris: &[[P3; 3]], z: f64, extra: &[Vec<P2>]) -> Result<Vec<(Vec<P2>, Vec<Vec<P2>>)>, String> {
+    let mut polys = vec![];
+    for e in extra.iter().filter(|e| e.len() >= 3) {
+        let mut e = e.clone();
+        if signed_area(&e) < 0.0 {
+            e.reverse();
+        }
+        polys.push(to_geo(&e, &[]));
+    }
+    let m = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        polys.extend(clip_face(outer, holes, tris, z, true).0);
+        union_tree(polys)
+    }))
+        .map_err(|_| format!("could not work out the surface outline at Z{}", fmt(z)))?;
+    Ok(m.0
+        .iter()
+        .map(|p| {
+            let holes = p.interiors().iter().map(from_geo_ring).filter(|h| h.len() >= 3 && signed_area(h).abs() > 1e-4).collect();
+            (from_geo_ring(p.exterior()), holes)
+        })
+        .filter(|(o, _)| o.len() >= 3 && signed_area(o).abs() > 1e-4)
+        .collect())
+}
+
+/// Seen from above, the half of the XY plane where the plane of `tris` is
+/// at or below (`below`) / above `z`, as a large polygon (None: nowhere).
+/// `big` must be larger than the face (kept small for precision).
+fn half_plane(tris: &[[P3; 3]], z: f64, below: bool, big: f64) -> Option<geo::Polygon<f64>> {
+    // plane from the triangle with the largest area seen from above
+    let t = tris.iter().max_by(|a, b| tri_area(a).total_cmp(&tri_area(b)))?;
+    let (e1, e2) = ([t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]], [t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]]);
+    let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+    if n[2].abs() < 1e-12 {
+        return None;
+    }
+    // height = t0.z + g . (xy - t0.xy)
+    let g = [-n[0] / n[2], -n[1] / n[2]];
+    let gl = g[0].hypot(g[1]);
+    if gl < 1e-9 {
+        let kept = if below { t[0][2] <= z } else { t[0][2] > z };
+        return kept.then(|| to_geo(&[[-big, -big], [big, -big], [big, big], [-big, big]], &[]));
+    }
+    let u = [g[0] / gl, g[1] / gl]; // uphill
+    let s = (z - t[0][2]) / gl;
+    let c = [t[0][0] + u[0] * s, t[0][1] + u[1] * s]; // on the level line
+    let side = if below { -1.0 } else { 1.0 };
+    let v = [-u[1], u[0]];
+    let p = |a: f64, b: f64| [c[0] + v[0] * a + u[0] * side * b, c[1] + v[1] * a + u[1] * side * b];
+    let mut q = vec![p(-big, 0.0), p(big, 0.0), p(big, big), p(-big, big)];
+    if signed_area(&q) < 0.0 {
+        q.reverse();
+    }
+    Some(to_geo(&q, &[]))
+}
+
+fn tri_area(t: &[P3; 3]) -> f64 {
+    ((t[1][0] - t[0][0]) * (t[2][1] - t[0][1]) - (t[2][0] - t[0][0]) * (t[1][1] - t[0][1])).abs() / 2.0
+}
+
+/// The part of a planar face (outline `outer` less `holes`, plane from
+/// `tris`) at or below (`below`) / above `z`, seen from above.
+fn clip_face(outer: &[P2], holes: &[Vec<P2>], tris: &[[P3; 3]], z: f64, below: bool) -> geo::MultiPolygon<f64> {
+    use geo::BooleanOps;
+    let pts = || outer.iter().chain(holes.iter().flatten());
+    let big = pts().map(|p| p[0].abs().max(p[1].abs())).fold(1.0, f64::max) * 4.0;
+    let Some(h) = half_plane(tris, z, below, big) else { return geo::MultiPolygon::new(vec![]) };
+    let mut m = to_geo(outer, holes).intersection(&h);
+    // put corners of the face back exactly where they were, so the slice
+    // joins neighbouring faces without slivers
+    let snap = |c: &mut geo::Coord<f64>| {
+        if let Some(p) = pts().find(|p| (p[0] - c.x).abs() < 1e-6 && (p[1] - c.y).abs() < 1e-6) {
+            (c.x, c.y) = (p[0], p[1]);
+        }
+    };
+    use geo::MapCoordsInPlace;
+    m.map_coords_in_place(|mut c| {
+        snap(&mut c);
+        c
+    });
+    m
+}
+
+/// Union of many polygons by merging pairs (much faster than one at a time).
+fn union_tree(polys: Vec<geo::Polygon<f64>>) -> geo::MultiPolygon<f64> {
+    use geo::BooleanOps;
+    let mut parts: Vec<geo::MultiPolygon<f64>> = polys.into_iter().map(|p| geo::MultiPolygon::new(vec![p])).collect();
+    if parts.is_empty() {
+        return geo::MultiPolygon::new(vec![]);
+    }
+    while parts.len() > 1 {
+        let mut next = Vec::with_capacity(parts.len() / 2 + 1);
+        let mut it = parts.into_iter();
+        while let Some(a) = it.next() {
+            next.push(match it.next() {
+                Some(b) => a.union(&b),
+                None => a,
+            });
+        }
+        parts = next;
+    }
+    parts.pop().unwrap()
+}
+
+/// Z levels of a sloped pocket: even steps down to the lowest point of the
+/// surface, plus one at its highest point.
+pub fn sloped_levels(op: &PocketOp) -> Vec<f64> {
+    let top = floor_top(&op.floor);
+    let mut zs = levels(op.start_z, op.z, op.depth_per_pass);
+    if top < op.start_z - 1e-6 && top > op.z + 1e-6 {
+        zs.push(top);
+    }
+    zs.sort_by(|a, b| b.total_cmp(a));
+    zs.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    zs
+}
+
+/// Sloped floor: at each level clear (and finish the walls of) the slice of
+/// the pocket where the surface lies below the level.
+fn sloped_pocket_moves(op: &PocketOp, retract: f64) -> Result<Vec<Mv>, String> {
+    let mut out = vec![];
+    let mut z_prev = op.start_z;
+    for z in sloped_levels(op) {
+        let extra: Vec<Vec<P2>> = if op.keep_islands {
+            vec![]
+        } else {
+            op.islands.iter().enumerate().filter(|(k, _)| op.islands_z.get(*k).map_or(true, |&iz| iz <= z + 1e-6)).map(|(_, l)| l.clone()).collect()
+        };
+        for (outer, islands) in slice_below(&op.outer, &op.islands, &op.floor, z, &extra)? {
+            let level = PocketOp {
+                z,
+                start_z: z_prev,
+                depth_per_pass: z_prev - z + 1.0,
+                outer,
+                islands,
+                keep_islands: true,
+                floor: vec![],
+                islands_z: vec![],
+                edges: vec![],
+                ..op.clone()
+            };
+            // slices too narrow for the cutter are left
+            if let Ok(m) = pocket_moves(&level, retract) {
+                out.extend(m);
+            }
+        }
+        z_prev = z;
+    }
+    if out.is_empty() {
+        return Err(format!("cutter Ø{} does not fit in the sloped pocket at any level", fmt(op.cutter.dia())));
+    }
+    Ok(out)
+}
+
 fn pocket_moves(op: &PocketOp, retract: f64) -> Result<Vec<Mv>, String> {
+    if !op.floor.is_empty() {
+        return sloped_pocket_moves(op, retract);
+    }
     let d = op.cutter.dia();
     let r = d / 2.0;
     let islands: Vec<Vec<P2>> = if op.keep_islands { op.islands.clone() } else { vec![] };
@@ -853,6 +1104,28 @@ fn face_moves(op: &FaceOp, retract: f64) -> Vec<Mv> {
     out.moves
 }
 
+// ------------------------------------------------------------------ engrave
+/// Each glyph contour is followed at every depth level before moving on to
+/// the next one; the cutter plunges at the contour start.
+fn engrave_moves(op: &EngraveOp, retract: f64) -> Result<Vec<Mv>, String> {
+    let paths = engrave::text_paths(op)?;
+    let lift = op.z + 0.5;
+    let plunge = (op.feed * 0.5).max(1.0);
+    let mut out = Path::new([paths[0][0][0], paths[0][0][1], retract]);
+    for c in &paths {
+        let p0 = c[0];
+        out.reposition(retract, p0, lift);
+        for z in levels(op.z, op.bottom(), op.depth_per_pass) {
+            out.feed([p0[0], p0[1], z], plunge);
+            for p in &c[1..] {
+                out.feed([p[0], p[1], z], op.feed);
+            }
+        }
+    }
+    out.rapid([out.pos[0], out.pos[1], retract]);
+    Ok(out.moves)
+}
+
 // ------------------------------------------------------------------ profile
 /// Centre paths for a profile: closed paths end where they start.
 pub fn profile_paths(op: &ProfileOp) -> Result<Vec<Vec<P2>>, String> {
@@ -992,9 +1265,11 @@ pub fn rough_levels(op: &RoughOp) -> Vec<f64> {
     let bottom = op.final_z();
     let mut zs = levels(op.start_z, bottom, op.layer_height);
     for f in &op.faces {
-        let z = f.z + op.allowance.max(0.0);
-        if z < op.start_z - 1e-6 && z > bottom + 1e-6 {
-            zs.push(z);
+        for z in [f.z, f.low()] {
+            let z = z + op.allowance.max(0.0);
+            if z < op.start_z - 1e-6 && z > bottom + 1e-6 {
+                zs.push(z);
+            }
         }
     }
     zs.sort_by(|a, b| b.total_cmp(a));
@@ -1027,16 +1302,82 @@ pub struct RoughLayer {
     pub floored: Vec<(Vec<P2>, Vec<Vec<P2>>)>,
 }
 
-/// Work out layer `z`. The part outline (all faces seen from above, holes
-/// filled) bounds the clearing; material is every face above the layer
-/// (less the allowance). Outside the outline nothing is cleared - the
-/// exterior contours of the material are only outlined.
-pub fn rough_layer(op: &RoughOp, z: f64) -> Result<RoughLayer, String> {
-    use geo::BooleanOps;
+/// How much clipped mesh triangles are grown so neighbours overlap and
+/// merge into one region (material side: conservative).
+const MESH_GROW: f64 = 0.01;
+
+/// A convex polygon pushed out by `eps` from its centre.
+fn grow_convex(q: &[P2], eps: f64) -> Vec<P2> {
+    let c = q.iter().fold([0.0, 0.0], |a, p| [a[0] + p[0], a[1] + p[1]]);
+    let c = [c[0] / q.len() as f64, c[1] / q.len() as f64];
+    q.iter()
+        .map(|p| {
+            let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
+            let l = dx.hypot(dy).max(1e-12);
+            [p[0] + dx / l * eps, p[1] + dy / l * eps]
+        })
+        .collect()
+}
+
+/// The parts of mesh triangles above `z` (all of them for `z` = -inf),
+/// seen from above, grown slightly so they join up.
+fn mesh_above(tris: &[[P3; 3]], z: f64) -> Vec<geo::Polygon<f64>> {
+    let mut out = vec![];
+    for t in tris {
+        if t.iter().all(|p| p[2] <= z) {
+            continue;
+        }
+        let mut q: Vec<P2> = vec![];
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            let (ia, ib) = (a[2] > z, b[2] > z);
+            if ia {
+                q.push([a[0], a[1]]);
+            }
+            if ia != ib {
+                let s = (z - a[2]) / (b[2] - a[2]);
+                q.push([a[0] + (b[0] - a[0]) * s, a[1] + (b[1] - a[1]) * s]);
+            }
+        }
+        if q.len() < 3 || signed_area(&q).abs() < 1e-8 {
+            continue; // seen edge-on
+        }
+        if signed_area(&q) < 0.0 {
+            q.reverse();
+        }
+        out.push(to_geo(&grow_convex(&q, MESH_GROW), &[]));
+    }
+    out
+}
+
+/// Per-op geometry that does not depend on the layer.
+pub struct RoughGeom {
+    /// Each face seen from above (curved faces: the union of their mesh).
+    full: Vec<geo::MultiPolygon<f64>>,
+    /// Part outline grown by tool radius + allowance + OPEN_EDGE.
+    grown: geo::MultiPolygon<f64>,
+    through: Vec<Vec<P2>>,
+    voids: geo::MultiPolygon<f64>,
+}
+
+pub fn rough_geom(op: &RoughOp) -> Result<RoughGeom, String> {
     let a = op.allowance.max(0.0);
     let g = op.cutter.dia() / 2.0 + a + OPEN_EDGE;
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let outline = union_all(op.faces.iter().map(|f| to_geo(&f.outer, &[])));
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let full: Vec<geo::MultiPolygon<f64>> = op
+            .faces
+            .iter()
+            .map(|f| {
+                use geo::Simplify;
+                if f.curved {
+                    union_tree(mesh_above(&f.tris, f64::NEG_INFINITY)).simplify(&(MESH_GROW * 0.5))
+                } else {
+                    geo::MultiPolygon::new(vec![to_geo(&f.outer, &f.holes)])
+                }
+            })
+            .collect();
+        // part outline: every face seen from above, holes filled
+        let outline = union_tree(full.iter().flat_map(|m| m.0.iter().map(|p| geo::Polygon::new(p.exterior().clone(), vec![]))).collect());
         let grown = union_all(
             outline
                 .0
@@ -1045,11 +1386,8 @@ pub fn rough_layer(op: &RoughOp, z: f64) -> Result<RoughLayer, String> {
                 .filter(|l| signed_area(l) > 0.0)
                 .map(|l| to_geo(&l, &[])),
         );
-        let keep = union_all(op.faces.iter().filter(|f| f.z > z - a + 1e-6).map(|f| to_geo(&f.outer, &f.holes)));
-        let cut = grown.difference(&keep);
-        let all = union_all(op.faces.iter().map(|f| to_geo(&f.outer, &f.holes)));
-        let through: Vec<Vec<P2>> =
-            all.0.iter().flat_map(|p| p.interiors().iter().map(from_geo_ring)).filter(|h| h.len() >= 3).collect();
+        let all = union_tree(full.iter().flat_map(|m| m.0.iter().cloned()).collect());
+        let through: Vec<Vec<P2>> = all.0.iter().flat_map(|p| p.interiors().iter().map(from_geo_ring)).filter(|h| h.len() >= 3 && signed_area(h).abs() > 1e-3).collect();
         // Through holes shrunk by twice the allowance (+ a hair) so the floored
         // clearing meets the through-hole profile without leaving a thin wall.
         let voids = union_all(
@@ -1059,19 +1397,60 @@ pub fn rough_layer(op: &RoughOp, z: f64) -> Result<RoughLayer, String> {
                 .filter(|l| signed_area(l) > 0.0)
                 .map(|l| to_geo(&l, &[])),
         );
-        let floored = cut.difference(&voids);
-        (cut, floored, keep, through)
+        RoughGeom { full, grown, through, voids }
+    }))
+    .map_err(|_| "could not work out the part outline".to_string())
+}
+
+/// Work out layer `z`. The part outline (all faces seen from above, holes
+/// filled) bounds the clearing; material is every face above the layer
+/// (less the allowance) - only the part above the layer for sloped and
+/// curved faces. Outside the outline nothing is cleared - the exterior
+/// contours of the material are only outlined.
+#[cfg(test)]
+pub fn rough_layer(op: &RoughOp, z: f64) -> Result<RoughLayer, String> {
+    rough_layer_in(op, &rough_geom(op)?, z)
+}
+
+pub fn rough_layer_in(op: &RoughOp, geom: &RoughGeom, z: f64) -> Result<RoughLayer, String> {
+    use geo::BooleanOps;
+    let a = op.allowance.max(0.0);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // material at this layer: flat faces above it, and the part of each
+        // sloped / curved face that is above it
+        let zc = z - a + 1e-6;
+        let mut polys: Vec<geo::Polygon<f64>> = vec![];
+        for (f, full) in op.faces.iter().zip(&geom.full) {
+            if f.z <= zc {
+                continue;
+            }
+            if f.tris.is_empty() || f.low() > zc {
+                polys.extend(full.0.iter().cloned());
+            } else if f.curved {
+                polys.extend(mesh_above(&f.tris, zc));
+            } else {
+                polys.extend(clip_face(&f.outer, &f.holes, &f.tris, zc, false).0);
+            }
+        }
+        // mesh slices have many tiny edges: simplify (within less than MESH_GROW)
+        let keep = {
+            use geo::Simplify;
+            union_tree(polys).simplify(&(MESH_GROW * 0.5))
+        };
+        let cut = geom.grown.difference(&keep);
+        let floored = cut.difference(&geom.voids);
+        (cut, floored, keep)
     }))
     .map_err(|_| format!("could not work out the part outline at Z{}", fmt(z)))?;
-    let (cut, floored, keep, through) = res;
+    let (cut, floored, keep) = res;
     let regions_of = |m: &geo::MultiPolygon<f64>| -> Vec<(Vec<P2>, Vec<Vec<P2>>)> {
         m.0.iter()
             .map(|p| (from_geo_ring(p.exterior()), p.interiors().iter().map(from_geo_ring).collect::<Vec<_>>()))
             .filter(|(o, _)| o.len() >= 3)
             .collect()
     };
-    let contours = keep.0.iter().map(|p| from_geo_ring(p.exterior())).filter(|o| o.len() >= 3).collect();
-    Ok(RoughLayer { regions: regions_of(&cut), floored: regions_of(&floored), contours, through })
+    let contours = keep.0.iter().map(|p| from_geo_ring(p.exterior())).filter(|o| o.len() >= 3 && signed_area(o).abs() > 1e-3).collect();
+    Ok(RoughLayer { regions: regions_of(&cut), floored: regions_of(&floored), contours, through: geom.through.clone() })
 }
 
 /// One closed loop (already closed, in cutting direction) from `z_from` down
@@ -1097,8 +1476,9 @@ fn rough_moves(op: &RoughOp, retract: f64) -> Result<Vec<Mv>, String> {
     let tan = op.ramp_angle.to_radians().tan().max(1e-3);
     let mut out = vec![];
     let mut z_prev = op.start_z;
+    let geom = rough_geom(op)?;
     for z in rough_levels(op) {
-        let layer = rough_layer(op, z)?;
+        let layer = rough_layer_in(op, &geom, z)?;
         // clear inside the part; without clear voids, areas over a through
         // hole are left and the hole is only profiled
         let regions = if op.clear_voids { layer.regions } else { layer.floored };
@@ -1225,6 +1605,33 @@ pub fn validate(op: &StepOp, s: &Settings, tabs_top: f64) -> Vec<String> {
         OpKind::Pocket(p) => (p.start_z, p.z, p.cutter, p.depth_per_pass, p.feed, p.speed),
         OpKind::Profile(p) => (p.start_z, p.z, p.cutter, p.depth_per_pass, p.feed, p.speed),
         OpKind::Rough(r) => (r.start_z, r.final_z(), r.cutter, r.layer_height, r.feed, r.speed),
+        OpKind::Engrave(g) => {
+            if !g.tool.in_table(s) {
+                e.push(format!("T{} is not in the tool table", g.tool.tool_number()));
+            }
+            if !(g.depth > 0.0) {
+                e.push("engraving depth must be > 0".into());
+            } else if g.depth > g.tool.max_depth() + 1e-9 {
+                e.push(format!("depth {} exceeds the tool's max depth {}", fmt(g.depth), fmt(g.tool.max_depth())));
+            }
+            if !(g.depth_per_pass > 0.0) || !(g.feed > 0.0) || !(g.speed > 0.0) {
+                e.push("depth per pass, feed and speed must be > 0".into());
+            }
+            if let Err(err) = engrave::text_paths(g) {
+                e.push(err);
+            }
+            let retract = g.z.max(tabs_top) + s.clearance;
+            if retract > s.safe_z {
+                e.push(format!("retract height {} is above the rapid plane Z {}", fmt(retract), fmt(s.safe_z)));
+            }
+            return e;
+        }
+        OpKind::Thread(t) => {
+            for is in crate::gcode::validate_group(&t.group, s) {
+                e.push(is.msg);
+            }
+            return e;
+        }
         OpKind::Tab(t) => {
             if !(t.width > 0.0 && t.depth > 0.0 && t.z_height > 0.0) {
                 e.push("tab width, depth and Z height must be > 0".into());
@@ -1311,38 +1718,56 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
     }
     let cutting: Vec<(usize, &StepOp)> = job.ops.iter().enumerate().filter(|(_, o)| o.enabled && !matches!(o.kind, OpKind::Tab(_))).collect();
     if cutting.is_empty() && errors.is_empty() {
-        errors.push("no Face, Pocket, Profile or Rough operations - right-click a flat surface or an edge in the 3D view".into());
+        errors.push("no Face, Pocket, Profile, Rough, Engrave or Thread operations - right-click a surface or an edge in the 3D view".into());
     }
     if !errors.is_empty() {
         return Err(errors);
     }
 
-    let mut out = String::new();
-    let mut line = |l: String| {
-        out.push_str(&l.replace('Ø', "D"));
-        out.push('\n');
-    };
-    line("%".into());
-    line("(stepCAM - step milling)".into());
+    let mut w = Out { s: String::new(), tool: None, rpm: -1.0 };
+    w.line("%".into());
+    w.line("(stepCAM - step milling)".into());
     if !job.step_path.is_empty() {
         let name = std::path::Path::new(&job.step_path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        line(format!("(model {})", name.replace(['(', ')'], "")));
+        w.line(format!("(model {})", name.replace(['(', ')'], "")));
     }
     for t in &tabs {
-        line(format!("(mill tab X{} Y{} Z{} to Z{} {}x{})", fmt(t.center[0]), fmt(t.center[1]), fmt(t.center[2]), fmt(t.top()), fmt(t.width), fmt(t.depth)));
+        w.line(format!("(mill tab X{} Y{} Z{} to Z{} {}x{})", fmt(t.center[0]), fmt(t.center[1]), fmt(t.center[2]), fmt(t.top()), fmt(t.width), fmt(t.depth)));
     }
-    line("G21 G90 G17 G94 G40 G49 G80".into());
-    line(format!("G0 Z{}", fmt(s.safe_z)));
+    w.line("G21 G90 G17 G94 G40 G49 G80".into());
+    w.line(format!("G0 Z{}", fmt(s.safe_z)));
 
-    let mut tool: Option<u32> = None;
-    let mut rpm: f64 = -1.0;
     for (i, op) in cutting {
-        let (cutter, speed, start_z) = match &op.kind {
-            OpKind::Face(f) => (f.cutter, f.speed, f.start_z),
-            OpKind::Pocket(p) => (p.cutter, p.speed, p.start_z),
-            OpKind::Profile(p) => (p.cutter, p.speed, p.start_z),
-            OpKind::Rough(r) => (r.cutter, r.speed, r.start_z),
-            OpKind::Tab(_) => unreachable!(),
+        // holes: bore with the end mill, then thread with the thread mill
+        if let OpKind::Thread(th) = &op.kind {
+            let g = &th.group;
+            let locs = g.parse_locations().unwrap_or_default();
+            if locs.is_empty() {
+                continue;
+            }
+            let tm = s.thread_mill(g.thread);
+            w.line(String::new());
+            w.change(s, g.cutter.tool_number(), &format!("endmill Ø{} flute {}", fmt(g.cutter.dia()), fmt(g.cutter.flute_len())), s.spindle_rpm);
+            w.line(format!("(op {}: {} - bore)", i + 1, op.label()));
+            w.line(format!("G0 Z{}", fmt(s.safe_z)));
+            w.raw(&crate::gcode::bore_code(s, g, &locs));
+            w.line(format!("G0 Z{}", fmt(s.safe_z)));
+            w.line(String::new());
+            w.change(s, tm.tool, &format!("thread mill {} Ø{} reach {}", g.thread.name(), fmt(tm.dia), fmt(tm.reach)), s.spindle_rpm);
+            w.line(format!("(op {}: {} - thread)", i + 1, op.label()));
+            w.line(format!("G0 Z{}", fmt(s.safe_z)));
+            w.raw(&crate::gcode::thread_code(s, g, &locs));
+            w.line(format!("G0 Z{}", fmt(s.safe_z)));
+            continue;
+        }
+        let mill = |c: Cutter| (c.tool_number(), c.dia() / 2.0, format!("endmill Ø{} flute {}", fmt(c.dia()), fmt(c.flute_len())));
+        let ((t, tool_r, tool_desc), speed, start_z) = match &op.kind {
+            OpKind::Face(f) => (mill(f.cutter), f.speed, f.start_z),
+            OpKind::Pocket(p) => (mill(p.cutter), p.speed, p.start_z),
+            OpKind::Profile(p) => (mill(p.cutter), p.speed, p.start_z),
+            OpKind::Rough(r) => (mill(r.cutter), r.speed, r.start_z),
+            OpKind::Engrave(g) => ((g.tool.tool_number(), g.tool.width_at(g.depth) / 2.0, g.tool.describe()), g.speed, g.z),
+            OpKind::Tab(_) | OpKind::Thread(_) => unreachable!(),
         };
         let retract = start_z.max(tabs_top) + s.clearance;
         let mut moves = match &op.kind {
@@ -1359,40 +1784,24 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
                 Ok(m) => m,
                 Err(e) => return Err(vec![format!("op {}: {e}", i + 1)]),
             },
-            OpKind::Tab(_) => unreachable!(),
+            OpKind::Engrave(g) => match engrave_moves(g, retract) {
+                Ok(m) => m,
+                Err(e) => return Err(vec![format!("op {}: {e}", i + 1)]),
+            },
+            OpKind::Tab(_) | OpKind::Thread(_) => unreachable!(),
         };
         let start = match moves.first() {
             Some(Mv::Rapid(p)) | Some(Mv::Feed(p, _)) => [p[0], p[1], s.safe_z],
             None => continue,
         };
         for t in &tabs {
-            moves = apply_tab(&moves, start, t, cutter.dia() / 2.0);
+            moves = apply_tab(&moves, start, t, tool_r);
         }
 
-        let t = cutter.tool_number();
-        line(String::new());
-        if tool != Some(t) {
-            if tool.is_some() {
-                line("M5".into());
-                line("M9".into());
-            }
-            line(format!("G0 Z{}", fmt(s.safe_z)));
-            line(format!("T{t} M6 (endmill Ø{} flute {})", fmt(cutter.dia()), fmt(cutter.flute_len())));
-            if s.tool_length_comp {
-                line(format!("G43 H{t}"));
-            }
-            line(format!("S{} M3", speed.round() as i64));
-            if s.coolant {
-                line("M8".into());
-            }
-            tool = Some(t);
-            rpm = speed;
-        } else if (rpm - speed).abs() > 0.5 {
-            line(format!("S{} M3", speed.round() as i64));
-            rpm = speed;
-        }
-        line(format!("(op {}: {})", i + 1, op.label()));
-        line(format!("G0 Z{}", fmt(s.safe_z)));
+        w.line(String::new());
+        w.change(s, t, &tool_desc, speed);
+        w.line(format!("(op {}: {})", i + 1, op.label()));
+        w.line(format!("G0 Z{}", fmt(s.safe_z)));
 
         let mut pos = start;
         let mut last_f = -1.0;
@@ -1402,45 +1811,88 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
                     let xy = (p[0] - pos[0]).abs() > 1e-9 || (p[1] - pos[1]).abs() > 1e-9;
                     let zc = (p[2] - pos[2]).abs() > 1e-9;
                     if zc && p[2] > pos[2] {
-                        line(format!("G0 Z{}", fmt(p[2])));
+                        w.line(format!("G0 Z{}", fmt(p[2])));
                     }
                     if xy {
-                        line(format!("G0 X{} Y{}", fmt(p[0]), fmt(p[1])));
+                        w.line(format!("G0 X{} Y{}", fmt(p[0]), fmt(p[1])));
                     }
                     if zc && p[2] < pos[2] {
-                        line(format!("G0 Z{}", fmt(p[2])));
+                        w.line(format!("G0 Z{}", fmt(p[2])));
                     }
                     pos = p;
                 }
                 Mv::Feed(p, f) => {
-                    let mut w = String::from("G1");
+                    let mut cmd = String::from("G1");
                     for (k, a) in ["X", "Y", "Z"].iter().enumerate() {
                         if (p[k] - pos[k]).abs() > 1e-9 {
-                            w.push_str(&format!(" {a}{}", fmt(p[k])));
+                            cmd.push_str(&format!(" {a}{}", fmt(p[k])));
                         }
                     }
-                    if w == "G1" {
+                    if cmd == "G1" {
                         continue;
                     }
                     if (f - last_f).abs() > 1e-9 {
-                        w.push_str(&format!(" F{}", fmt(f)));
+                        cmd.push_str(&format!(" F{}", fmt(f)));
                         last_f = f;
                     }
-                    line(w);
+                    w.line(cmd);
                     pos = p;
                 }
             }
         }
-        line(format!("G0 Z{}", fmt(s.safe_z)));
+        w.line(format!("G0 Z{}", fmt(s.safe_z)));
     }
-    line(String::new());
-    line("M5".into());
-    line("M9".into());
-    line(format!("G0 Z{}", fmt(s.safe_z)));
-    line("M30".into());
-    line("%".into());
-    Ok(out)
+    w.line(String::new());
+    w.line("M5".into());
+    w.line("M9".into());
+    w.line(format!("G0 Z{}", fmt(s.safe_z)));
+    w.line("M30".into());
+    w.line("%".into());
+    Ok(w.s)
 }
+
+/// Program text with tool / spindle state.
+struct Out {
+    s: String,
+    tool: Option<u32>,
+    rpm: f64,
+}
+
+impl Out {
+    fn line(&mut self, l: String) {
+        self.s.push_str(&l.replace('Ø', "D"));
+        self.s.push('\n');
+    }
+    /// Lines already in program form.
+    fn raw(&mut self, code: &str) {
+        self.s.push_str(&code.replace('Ø', "D"));
+    }
+    /// Change to tool `t` (or just the spindle speed) when needed.
+    fn change(&mut self, s: &Settings, t: u32, desc: &str, speed: f64) {
+        if self.tool != Some(t) {
+            if self.tool.is_some() {
+                self.line("M5".into());
+                self.line("M9".into());
+            }
+            self.line(format!("G0 Z{}", fmt(s.safe_z)));
+            self.line(format!("T{t} M6 ({desc})"));
+            if s.tool_length_comp {
+                self.line(format!("G43 H{t}"));
+            }
+            self.line(format!("S{} M3", speed.round() as i64));
+            if s.coolant {
+                self.line("M8".into());
+            }
+            self.tool = Some(t);
+            self.rpm = speed;
+        } else if (self.rpm - speed).abs() > 0.5 {
+            self.line(format!("S{} M3", speed.round() as i64));
+            self.rpm = speed;
+        }
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -1786,7 +2238,7 @@ mod rough_tests {
             layer_height: 2.0,
             start_z: 0.0,
             bottom_z: -10.0,
-            faces: vec![RoughFace { z: 0.0, outer: sq(10.0, 30.0), holes: vec![] }, RoughFace { z: -5.0, outer: sq(0.0, 40.0), holes: vec![sq(10.0, 30.0)] }],
+            faces: vec![RoughFace { z: 0.0, outer: sq(10.0, 30.0), holes: vec![], tris: vec![], curved: false }, RoughFace { z: -5.0, outer: sq(0.0, 40.0), holes: vec![sq(10.0, 30.0)], tris: vec![], curved: false }],
             ..Default::default()
         };
         let moves = rough_moves(&op, 2.0).unwrap();
@@ -1820,7 +2272,7 @@ mod rough_tests {
             start_z: 0.0,
             bottom_z: -10.0,
             layer_height: 3.0,
-            faces: vec![RoughFace { z: 0.0, outer: sq(0.0, 40.0), holes: vec![] }],
+            faces: vec![RoughFace { z: 0.0, outer: sq(0.0, 40.0), holes: vec![], tris: vec![], curved: false }],
             ..Default::default()
         };
         let minz = |op: &RoughOp| {
@@ -1847,8 +2299,8 @@ mod rough_tests {
             layer_height: 5.0,
             clear_voids: false,
             faces: vec![
-                RoughFace { z: 0.0, outer: sq(0.0, 40.0), holes: vec![sq(10.0, 20.0), rect(25.0, 5.0, 35.0, 15.0)] },
-                RoughFace { z: -4.0, outer: rect(25.0, 5.0, 35.0, 15.0), holes: vec![] },
+                RoughFace { z: 0.0, outer: sq(0.0, 40.0), holes: vec![sq(10.0, 20.0), rect(25.0, 5.0, 35.0, 15.0)], tris: vec![], curved: false },
+                RoughFace { z: -4.0, outer: rect(25.0, 5.0, 35.0, 15.0), holes: vec![], tris: vec![], curved: false },
             ],
             ..Default::default()
         };
@@ -1891,8 +2343,8 @@ mod rough_tests {
             layer_height: 5.0,
             clear_voids: false,
             faces: vec![
-                RoughFace { z: 0.0, outer: sq(0.0, 40.0), holes: vec![sq(10.0, 30.0)] },
-                RoughFace { z: -3.0, outer: sq(10.0, 30.0), holes: vec![sq(16.0, 24.0)] },
+                RoughFace { z: 0.0, outer: sq(0.0, 40.0), holes: vec![sq(10.0, 30.0)], tris: vec![], curved: false },
+                RoughFace { z: -3.0, outer: sq(10.0, 30.0), holes: vec![sq(16.0, 24.0)], tris: vec![], curved: false },
             ],
             ..Default::default()
         };
@@ -1933,3 +2385,229 @@ mod stock_tests {
         assert_eq!(Stock::default().bounds(min, max), (min, max));
     }
 }
+
+#[cfg(test)]
+mod engrave_tests {
+    use super::*;
+    use crate::toolpath;
+
+    #[test]
+    fn engraving_cuts_to_depth_in_passes() {
+        let job = StepJob {
+            ops: vec![StepOp {
+                enabled: true,
+                kind: OpKind::Engrave(EngraveOp { z: -2.0, origin: [30.0, 20.0], text: "AB".into(), depth: 0.5, depth_per_pass: 0.25, ..Default::default() }),
+            }],
+            ..Default::default()
+        };
+        let mut s = Settings::default();
+        s.safe_z = 10.0;
+        let code = generate(&job, &s).unwrap();
+        let tp = toolpath::parse(&code);
+        let feeds: Vec<[f32; 3]> = tp.paths.iter().filter(|p| p.kind != toolpath::MoveKind::Rapid).flat_map(|p| p.pts.clone()).collect();
+        let lo = feeds.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+        let hi = feeds.iter().filter(|p| p[2] < -1.9).map(|p| p[2]).fold(f32::NEG_INFINITY, f32::max);
+        assert!((lo + 2.5).abs() < 1e-4, "{lo}");
+        assert!(feeds.iter().any(|p| (p[2] + 2.25).abs() < 1e-4), "no first pass at -2.25");
+        assert!(hi <= -2.0 + 1e-4);
+        assert!(feeds.iter().all(|p| (p[0] - 30.0).abs() < 10.0 && (p[1] - 20.0).abs() < 5.0));
+    }
+}
+
+#[cfg(test)]
+mod engrave_bit_tests {
+    use super::*;
+    use crate::engrave::EngraveTool;
+
+    #[test]
+    fn engraving_bit_tool_change_and_depth_limit() {
+        let s = Settings { safe_z: 10.0, ..Default::default() };
+        let bit = s.engravers[2];
+        let mut job = StepJob {
+            ops: vec![StepOp { enabled: true, kind: OpKind::Engrave(EngraveOp { tool: EngraveTool::Bit(bit), ..Default::default() }) }],
+            ..Default::default()
+        };
+        let code = generate(&job, &s).unwrap();
+        assert!(code.contains(&format!("T{} M6 (engraver 90deg tip D0.3", bit.tool)), "{code}");
+        let set = |job: &mut StepJob, depth: f64, tool: EngraveTool| {
+            if let OpKind::Engrave(g) = &mut job.ops[0].kind {
+                (g.depth, g.tool) = (depth, tool);
+            }
+        };
+        set(&mut job, bit.max_depth + 0.1, EngraveTool::Bit(bit));
+        let errs = generate(&job, &s).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("max depth")), "{errs:?}");
+        set(&mut job, 0.3, EngraveTool::Bit(crate::model::Engraver { id: 99, tool: 99, ..bit }));
+        assert!(generate(&job, &s).unwrap_err().iter().any(|e| e.contains("T99 is not in the tool table")));
+    }
+}
+
+#[cfg(test)]
+mod sloped_tests {
+    use super::*;
+    use crate::toolpath;
+
+    /// Ramp x 10..40, y 10..30, falling from Z-1 at x=10 to Z-4 at x=40.
+    fn surf(x: f64) -> f64 {
+        -1.0 - 3.0 * (x - 10.0) / 30.0
+    }
+    fn ramp() -> Vec<[P3; 3]> {
+        let p = |x: f64, y: f64| [x, y, surf(x)];
+        vec![[p(10.0, 10.0), p(40.0, 10.0), p(40.0, 30.0)], [p(10.0, 10.0), p(40.0, 30.0), p(10.0, 30.0)]]
+    }
+
+    #[test]
+    fn slice_follows_the_slope() {
+        let sq = vec![[10.0, 10.0], [40.0, 10.0], [40.0, 30.0], [10.0, 30.0]];
+        let r = slice_below(&sq, &[], &ramp(), -2.5, &[]).unwrap();
+        assert_eq!(r.len(), 1);
+        let (lo, hi) = r[0].0.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
+        assert!((lo - 25.0).abs() < 1e-6 && (hi - 40.0).abs() < 1e-6, "{lo} {hi}");
+        assert!(slice_below(&sq, &[], &ramp(), -4.5, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sloped_pocket_steps_down_without_gouging() {
+        let op = PocketOp {
+            z: -4.0,
+            start_z: 0.0,
+            outer: vec![[10.0, 10.0], [40.0, 10.0], [40.0, 30.0], [10.0, 30.0]],
+            floor: ramp(),
+            cutter: Cutter::C3x17,
+            ..Default::default()
+        };
+        assert_eq!(sloped_levels(&op), vec![-1.0, -2.0, -3.0, -4.0]);
+        let job = StepJob { ops: vec![StepOp { enabled: true, kind: OpKind::Pocket(op) }], ..Default::default() };
+        let s = Settings { safe_z: 10.0, ..Default::default() };
+        let code = generate(&job, &s).unwrap();
+        let tp = toolpath::parse(&code);
+        let r = 1.5;
+        let mut levels_cut = std::collections::BTreeSet::new();
+        for p in tp.paths.iter().filter(|p| p.kind != toolpath::MoveKind::Rapid).flat_map(|p| p.pts.clone()) {
+            let (x, y, z) = (p[0] as f64, p[1] as f64, p[2] as f64);
+            if z > -0.999 {
+                continue; // above the ramp: entry moves
+            }
+            assert!(x >= 10.0 + r - 1e-3 && x <= 40.0 - r + 1e-3 && y >= 10.0 + r - 1e-3 && y <= 30.0 - r + 1e-3, "outside walls {p:?}");
+            // highest surface point under the tool is on its -X side
+            assert!(z >= surf(x - r) - 1e-3, "gouge at {p:?}: surface Z{}", surf(x - r));
+            levels_cut.insert((z * 1000.0).round() as i64);
+        }
+        for z in [-1000, -2000, -3000] {
+            assert!(levels_cut.contains(&z), "level {z} not cut: {levels_cut:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod rough_slope_tests {
+    use super::*;
+    use crate::toolpath;
+
+    /// Part 40 x 20, bottom Z-10: flat top Z0 for x 0..20, then a ramp down
+    /// to Z-6 at x = 40 (vertical walls elsewhere).
+    fn height(x: f64) -> f64 {
+        if x <= 20.0 {
+            0.0
+        } else if x <= 40.0 {
+            -0.3 * (x - 20.0)
+        } else {
+            f64::NEG_INFINITY
+        }
+    }
+
+    #[test]
+    fn roughing_follows_slopes_and_profiles_each_height() {
+        let rect = |x0: f64, y0: f64, x1: f64, y1: f64| vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+        let p = |x: f64, y: f64| [x, y, height(x)];
+        let ramp = vec![[p(20.0, 0.0), p(40.0, 0.0), p(40.0, 20.0)], [p(20.0, 0.0), p(40.0, 20.0), p(20.0, 20.0)]];
+        let op = RoughOp {
+            cutter: Cutter::C3x17,
+            start_z: 1.0,
+            bottom_z: -10.0,
+            faces: vec![
+                RoughFace { z: 0.0, outer: rect(0.0, 0.0, 20.0, 20.0), holes: vec![], tris: vec![], curved: false },
+                RoughFace { z: 0.0, outer: rect(20.0, 0.0, 40.0, 20.0), holes: vec![], tris: ramp, curved: false },
+            ],
+            ..Default::default()
+        };
+        let (r, a) = (1.5, op.allowance);
+        let levels = rough_levels(&op);
+        assert!(levels.iter().any(|z| (z + 5.8).abs() < 1e-9), "no layer at the foot of the slope: {levels:?}");
+        let job = StepJob { ops: vec![StepOp { enabled: true, kind: OpKind::Rough(op) }], ..Default::default() };
+        let s = Settings { safe_z: 12.0, ..Default::default() };
+        let code = generate(&job, &s).unwrap();
+        let tp = toolpath::parse(&code);
+        let pts: Vec<[f64; 3]> = tp.paths.iter().filter(|p| p.kind != toolpath::MoveKind::Rapid).flat_map(|p| p.pts.iter().map(|q| [q[0] as f64, q[1] as f64, q[2] as f64])).collect();
+        for q in &pts {
+            if q[1] >= r && q[1] <= 20.0 - r && q[0] - r < 40.0 {
+                let h = height((q[0] - r).max(0.0));
+                assert!(q[2] >= h + a - 1e-3, "gouge at {q:?}: surface {h} under the tool edge");
+            }
+        }
+        // the outside profile steps down the slope: at Z-3 it runs just past
+        // where the ramp is at Z-3.2 (x = 30.67), not around the full outline
+        let wall = 20.0 + 3.2 / 0.3 + r + a;
+        assert!(pts.iter().any(|q| (q[2] + 3.0).abs() < 1e-6 && (q[0] - wall).abs() < 0.05), "no cut at x {wall} on Z-3");
+        // and the slope is cut down to its foot
+        assert!(pts.iter().any(|q| q[2] < -5.0 && q[0] > 38.0 && q[1] > -2.0 && q[1] < 22.0), "slope not cut down to its foot");
+    }
+}
+
+#[cfg(test)]
+mod rough_curved_tests {
+    use super::*;
+    use crate::surface::{tessellate, Frame, Surf};
+    use crate::toolpath;
+
+    /// Block 40 x 40, top at Z0, bottom Z-10, with a spherical dome
+    /// (R 12.5, centre Z-7.5) rising to Z5 in the middle.
+    fn height(rho: f64) -> f64 {
+        if rho < 10.0 {
+            -7.5 + (12.5f64 * 12.5 - rho * rho).sqrt()
+        } else {
+            0.0
+        }
+    }
+
+    #[test]
+    fn roughing_steps_down_a_dome() {
+        let f = Frame { o: [20.0, 20.0, -7.5], x: [1.0, 0.0, 0.0], y: [0.0, 1.0, 0.0], z: [0.0, 0.0, 1.0] };
+        let rim: Vec<P3> = (0..72).map(|i| {
+            let a = TAU * i as f64 / 72.0;
+            [20.0 + 10.0 * a.cos(), 20.0 + 10.0 * a.sin(), 0.0]
+        }).collect();
+        let tris = tessellate(&Surf::Sphere { f, r: 12.5 }, &[rim.clone()], true);
+        assert!(tris.len() > 50);
+        let hole: Vec<P2> = rim.iter().map(|p| [p[0], p[1]]).collect();
+        let op = RoughOp {
+            cutter: Cutter::C3x17,
+            start_z: 6.0,
+            bottom_z: -10.0,
+            faces: vec![
+                RoughFace { z: 0.0, outer: vec![[0.0, 0.0], [40.0, 0.0], [40.0, 40.0], [0.0, 40.0]], holes: vec![hole.clone()], tris: vec![], curved: false },
+                RoughFace { z: 5.0, outer: hole, holes: vec![], tris, curved: true },
+            ],
+            ..Default::default()
+        };
+        let (r, a) = (1.5, op.allowance);
+        let job = StepJob { ops: vec![StepOp { enabled: true, kind: OpKind::Rough(op) }], ..Default::default() };
+        let s = Settings { safe_z: 16.0, ..Default::default() };
+        let tp = toolpath::parse(&generate(&job, &s).unwrap());
+        let pts: Vec<[f64; 3]> = tp.paths.iter().filter(|p| p.kind != toolpath::MoveKind::Rapid).flat_map(|p| p.pts.iter().map(|q| [q[0] as f64, q[1] as f64, q[2] as f64])).collect();
+        let mut stepped = std::collections::BTreeSet::new();
+        for q in &pts {
+            if q[0] < r || q[0] > 40.0 - r || q[1] < r || q[1] > 40.0 - r {
+                continue;
+            }
+            let rho = (q[0] - 20.0).hypot(q[1] - 20.0);
+            let h = height((rho - r).max(0.0));
+            assert!(q[2] >= h + a - 0.02, "gouge at {q:?}: dome Z{h} under the tool");
+            if rho < 10.0 + r && q[2] > 0.5 && q[2] < 4.5 {
+                stepped.insert((q[2] * 10.0).round() as i64);
+            }
+        }
+        assert!(stepped.len() >= 3, "dome not stepped down: {stepped:?}");
+    }
+}
+

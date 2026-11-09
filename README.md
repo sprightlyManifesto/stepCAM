@@ -9,16 +9,35 @@ Generates G-code to helically bore holes and then thread-mill them (M2–M6).
 - **Tools & Settings** tab: Z heights, feeds/speeds, and the editable tool tables (end mills and the thread mill for each size). **Save settings… / Load settings…** store all of it as a JSON file.
 - Hole depth = thread length + 1 pitch. Threads are milled bottom-up (G03, climb) from
   Z = top − length, so they stop one pitch above the bottom of the hole.
-- Tools (defaults, all editable): cutters T1–T5 (1x3, 1.5x6, 2x12, 3x17, 3.175x17), thread mills T11–T16 (M2…M6). Add, remove and renumber end mills or change their Ø / flute length; groups and operations using a tool follow the edit. Tool numbers must be unique across both tables.
+- Tools (defaults, all editable): cutters T1–T5 (1x3, 1.5x6, 2x12, 3x17, 3.175x17), thread mills T11–T16 (M2…M6), engraving bits T21–T23 (tapered: 30° / 60° / 90° included angle with a 0.1 / 0.2 / 0.3 mm tip flat, each with a max depth). Add, remove and renumber end mills or change their Ø / flute length; groups and operations using a tool follow the edit. Tool numbers must be unique across both tables.
 - All boring runs first, then all threading, so there are as few tool changes as possible.
 
 ## Step Milling tab
 
 - **Import STEP…** loads a part (B-rep faces built from lines, circles, ellipses and B-splines; loose
-  wire edges too). Flat faces are shaded; curved faces show as edges only. Inch files are scaled to mm.
+  wire edges too). Flat faces are shaded; cylindrical, conical, spherical, toroidal, B-spline and linear-extrusion faces are meshed and shaded too (other surface types show as edges only). Inch files are scaled to mm.
 - **Click** highlights a surface or an edge loop/chain; **Esc** clears it. **Right-click** opens the menu:
   - flat surface facing +Z → **Face** (mill the whole part down to it, with overlap past the part) or
     **Pocket** (clear inside its outer boundary; inner loops ignored unless "keep islands" is ticked)
+    or **Engrave text** (the tool centre follows the letter outlines, *depth* into the surface, in
+    *depth per pass* steps). Options: text (several lines allowed), capital height, font (built-in
+    Sans / Mono or **Browse…** for any .ttf / .otf), tool (an engraving bit or an end mill; the
+    groove width at full depth is shown), left / center / right and top / center /
+    bottom alignment, and X / Y of the anchor point from the centre of the surface.
+  - sloped flat surface (tilted but still facing upwards) → **Pocket**: cut down in depth-per-pass
+    levels; at each level the area where the surface is below that level is cleared and its walls are
+    cut to size (finish pass), leaving the slope as steps. Vertical and downward-facing surfaces have
+    no milling operations. Curved surfaces can be picked (for highlighting) but have no surface operations; Rough follows them.
+  - cylindrical hole → **Add to thread milling**: **Ctrl+click** (Cmd on macOS) holes to select
+    several (Ctrl+click a selected hole to drop it), then right-click one of them. This adds a
+    thread milling item to the list with the same fields as a group on the Thread Milling tab
+    (thread, hole start Z, thread length, descent angle, milling cutter, locations), bored and
+    thread milled in the step program. Locations come from the hole centres, start Z from the top
+    of the hole, the size from the closest tap-drill or major Ø (M2–M6, within 0.3 mm; a tap-drill
+    match wins, so Ø5 is M6), and the length from the modelled depth (blind holes: depth − 1 pitch,
+    so the hole depth matches; through holes: the full depth). Holes of different size, top or
+    depth become separate items. Only full, vertical holes qualify - not bosses, slot ends, corner
+    fillets or bores of other sizes. Mill tabs are not applied to these cycles.
   - any edge → **Add mill tab** (rectangle: width along the edge tangent, depth across it, Z height up
     from the edge). Every cut lifts over the tab, allowing for the cutter radius.
 - Pocket strategies: **Standard** (offset passes) or **Adaptive clearing** (trochoidal loops). Entry styles:
@@ -105,10 +124,17 @@ works layer by layer from the stock top (Start Z) down to the part bottom
 * Inside the part outline (seen from above) all material is cleared:
   pockets, holes and open steps such as the area above a flange. Open edges
   are cut right through, so no fin is left at the outline.
-* Outside the part nothing is cleared: each exterior contour is profiled
-  once per layer (CW, climb), ramping down along the contour.
-* **Layer height** sets the layer spacing; an extra layer is added at every
-  flat floor so floors are roughed to their depth.
+* Outside the part nothing is cleared: the outside outline of the material
+  at that height is profiled once per layer (CW, climb), ramping down along
+  the contour.
+* Sloped and curved surfaces are followed: at each layer only the part of
+  the surface above the layer (plus stock to leave) is kept, so slopes,
+  domes, fillets and chamfers are roughed down in steps and the outside
+  profile steps in and out with them. Curved surfaces of a type that can't
+  be meshed still count as solid up to their highest point.
+* **Layer height** sets the layer spacing; extra layers are added at every
+  flat floor and at the top and foot of every sloped or curved surface, so they are
+  roughed to their depth.
 * **Clear voids** (default on): pockets, steps and counterbores - anything
   with a face below it - are always cleared. Unticked, holes that go right
   through the part are not cleared, only profiled (CCW, climb, at tool

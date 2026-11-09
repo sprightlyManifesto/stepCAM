@@ -169,6 +169,45 @@ impl Cutter {
     }
 }
 
+/// Tapered engraving bit (V-bit): `angle` is the included angle of the
+/// cone, `tip` the diameter of the flat on the bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Engraver {
+    /// Stable identity of the tool-table row (0 = unknown, match by tool number).
+    pub id: u32,
+    pub tool: u32,
+    /// Included angle of the taper (degrees).
+    pub angle: f64,
+    /// Diameter of the flat tip (mm).
+    pub tip: f64,
+    /// Deepest cut the taper allows (mm).
+    pub max_depth: f64,
+}
+
+impl Default for Engraver {
+    fn default() -> Self {
+        Engraver::DEFAULTS[1]
+    }
+}
+
+impl Engraver {
+    pub const DEFAULTS: [Engraver; 3] = [
+        Engraver { id: 1, tool: 21, angle: 30.0, tip: 0.1, max_depth: 2.0 },
+        Engraver { id: 2, tool: 22, angle: 60.0, tip: 0.2, max_depth: 2.0 },
+        Engraver { id: 3, tool: 23, angle: 90.0, tip: 0.3, max_depth: 2.0 },
+    ];
+
+    pub fn name(self) -> String {
+        format!("{}° tip Ø{}", crate::gcode::fmt(self.angle), crate::gcode::fmt(self.tip))
+    }
+
+    /// Width of the cut at `depth` below the surface.
+    pub fn width_at(self, depth: f64) -> f64 {
+        self.tip + 2.0 * depth.max(0.0) * (self.angle.to_radians() / 2.0).tan()
+    }
+}
+
 /// Single-profile thread mill used for one thread size.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ThreadMill {
@@ -305,6 +344,8 @@ pub struct Settings {
     pub cutters: Vec<Cutter>,
     /// Thread mill per thread size (indexed by ThreadSize::index()).
     pub thread_mills: Vec<ThreadMill>,
+    /// Tapered engraving bits.
+    pub engravers: Vec<Engraver>,
 }
 
 impl Default for Settings {
@@ -322,6 +363,7 @@ impl Default for Settings {
             tool_length_comp: true,
             cutters: Cutter::DEFAULTS.to_vec(),
             thread_mills: ThreadSize::ALL.iter().map(|&t| ThreadMill::default_for(t)).collect(),
+            engravers: Engraver::DEFAULTS.to_vec(),
         }
     }
 }
@@ -350,6 +392,25 @@ impl Settings {
         self.cutters.iter().map(|c| c.id).max().unwrap_or(0) + 1
     }
 
+    /// The engraving-bit table entry `e` refers to (by row id, else tool number).
+    pub fn lookup_engraver(&self, e: Engraver) -> Option<Engraver> {
+        if e.id != 0 {
+            if let Some(t) = self.engravers.iter().find(|t| t.id == e.id) {
+                return Some(*t);
+            }
+        }
+        self.engravers.iter().copied().find(|t| t.tool == e.tool)
+    }
+
+    pub fn new_engraver_id(&self) -> u32 {
+        self.engravers.iter().map(|c| c.id).max().unwrap_or(0) + 1
+    }
+
+    /// Tool numbers used by all three tables.
+    pub fn used_tool_numbers(&self) -> Vec<u32> {
+        self.cutters.iter().map(|c| c.tool).chain(self.thread_mills.iter().map(|t| t.tool)).chain(self.engravers.iter().map(|e| e.tool)).collect()
+    }
+
     /// Fill in missing table entries (older or hand-edited files).
     pub fn normalize(&mut self) {
         while self.thread_mills.len() < ThreadSize::ALL.len() {
@@ -367,6 +428,15 @@ impl Settings {
                 used.insert(id);
             }
         }
+        let mut used = std::collections::HashSet::new();
+        for k in 0..self.engravers.len() {
+            let c = self.engravers[k];
+            if c.id == 0 || !used.insert(c.id) {
+                let id = (1..).find(|i| !used.contains(i) && !self.engravers.iter().any(|o| o.id == *i)).unwrap();
+                self.engravers[k].id = id;
+                used.insert(id);
+            }
+        }
         for (t, tm) in ThreadSize::ALL.iter().zip(self.thread_mills.iter_mut()) {
             if tm.tool == 0 {
                 tm.tool = ThreadMill::default_tool(*t);
@@ -378,7 +448,7 @@ impl Settings {
     pub fn tool_issues(&self) -> Vec<String> {
         let mut e = vec![];
         let mut seen: std::collections::BTreeMap<u32, usize> = Default::default();
-        for n in self.cutters.iter().map(|c| c.tool).chain(self.thread_mills.iter().map(|t| t.tool)) {
+        for n in self.used_tool_numbers() {
             *seen.entry(n).or_default() += 1;
         }
         for (n, k) in seen {
@@ -391,6 +461,14 @@ impl Settings {
         for c in &self.cutters {
             if !(c.dia > 0.0 && c.flute > 0.0) {
                 e.push(format!("T{}: diameter and flute length must be > 0", c.tool));
+            }
+        }
+        for b in &self.engravers {
+            if !(b.angle > 0.0 && b.angle < 180.0) {
+                e.push(format!("T{}: included angle must be between 0 and 180°", b.tool));
+            }
+            if !(b.tip >= 0.0 && b.max_depth > 0.0) {
+                e.push(format!("T{}: tip flat must be >= 0 and max depth > 0", b.tool));
             }
         }
         e
@@ -430,6 +508,11 @@ impl Job {
         for op in &mut self.step.ops {
             if let Some(c) = op.cutter_mut() {
                 sync(c);
+            }
+            if let Some(e) = op.engraver_mut() {
+                if let Some(t) = s.lookup_engraver(*e) {
+                    *e = t;
+                }
             }
         }
     }
@@ -477,5 +560,43 @@ mod tests {
         assert!(old.cutters[0].id != 0 && old.cutters[0].id != old.cutters[1].id);
         assert_eq!(old.thread_mills.len(), 6);
         assert_eq!(old.thread_mills[0].tool, 11);
+    }
+}
+
+#[cfg(test)]
+mod engraver_tests {
+    use super::*;
+
+    #[test]
+    fn groove_width_follows_taper() {
+        let b = Engraver { id: 1, tool: 21, angle: 90.0, tip: 0.2, max_depth: 2.0 };
+        assert!((b.width_at(0.0) - 0.2).abs() < 1e-9);
+        assert!((b.width_at(0.5) - 1.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn old_settings_get_default_bits_and_numbers_must_be_unique() {
+        let mut s: Settings = serde_json::from_str(r#"{"safe_z": 12.0}"#).unwrap();
+        s.normalize();
+        assert_eq!(s.engravers, Engraver::DEFAULTS.to_vec());
+        assert!(s.tool_issues().is_empty());
+        s.engravers[0].tool = 1; // clashes with end mill T1
+        assert!(s.tool_issues().iter().any(|e| e.contains("T1 is used 2 times")));
+        s.engravers[0].tool = 21;
+        s.engravers[1].angle = 180.0;
+        assert!(!s.tool_issues().is_empty());
+    }
+
+    #[test]
+    fn table_edits_follow_into_engrave_ops() {
+        use crate::engrave::{EngraveOp, EngraveTool};
+        use crate::stepmill::{OpKind, StepOp};
+        let mut job = Job::default();
+        job.step.ops.push(StepOp { enabled: true, kind: OpKind::Engrave(EngraveOp { tool: EngraveTool::Bit(Engraver::DEFAULTS[0]), ..Default::default() }) });
+        job.settings.engravers[0].tip = 0.05;
+        job.settings.engravers[0].tool = 30;
+        job.sync_cutters();
+        let OpKind::Engrave(g) = &job.step.ops[0].kind else { unreachable!() };
+        assert_eq!(g.tool, EngraveTool::Bit(job.settings.engravers[0]));
     }
 }

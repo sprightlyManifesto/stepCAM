@@ -23,7 +23,7 @@ pub struct HoleViz {
 pub struct ModelViz<'a> {
     pub model: &'a Model,
     pub sel_edges: &'a [usize],
-    pub sel_face: Option<usize>,
+    pub sel_faces: &'a [usize],
     pub tabs: &'a [MillTab],
     /// Stock box (min, max).
     pub stock: Option<([f64; 3], [f64; 3])>,
@@ -449,7 +449,7 @@ impl View3d {
             let n = self.rot(f3(f.normal));
             // light from the viewer: brightness from how much the face points at us
             let light = 0.35 + 0.65 * n[1].abs().max(n[2].abs() * 0.8).min(1.0);
-            let selected = mv.sel_face == Some(fi);
+            let selected = mv.sel_faces.contains(&fi);
             let base = if selected {
                 SELECT
             } else if f.is_up_horizontal() {
@@ -465,6 +465,17 @@ impl View3d {
             );
             for t in &f.tris {
                 let depth = t.iter().map(|&q| self.to_view(f3(q))[1]).sum::<f32>() / 3.0;
+                // curved faces: shade each triangle by its own normal
+                let c = if f.planar {
+                    c
+                } else {
+                    let (a, b) = ([t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]], [t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]]);
+                    let n = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+                    let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
+                    let n = self.rot(f3([n[0] / l, n[1] / l, n[2] / l]));
+                    let light = 0.35 + 0.65 * n[1].abs().max(n[2].abs() * 0.8).min(1.0);
+                    Color32::from_rgba_unmultiplied((base.r() as f32 * light) as u8, (base.g() as f32 * light) as u8, (base.b() as f32 * light) as u8, c.a())
+                };
                 tris.push((depth, [self.project(rect, f3(t[0])), self.project(rect, f3(t[1])), self.project(rect, f3(t[2]))], c));
             }
         }

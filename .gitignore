@@ -9,6 +9,19 @@
 /*.gcode
 /*.tap
 
+# Files saved by the app into the project root (jobs, settings, models
+# imported for a run); sample files live in testdata/
+/*.stepcam.json
+/stepcam-settings.json
+/*.step
+/*.stp
+/*.STEP
+/*.STP
+
+# Patch leftovers
+*.orig
+*.rej
+
 # Python (testdata/make_step.py)
 __pycache__/
 *.py[cod]
