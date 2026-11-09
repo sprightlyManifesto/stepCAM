@@ -336,6 +336,11 @@ pub struct Settings {
     /// feed at the tool centre is reduced automatically for the arc.
     pub thread_feed: f64,
 
+    /// Machine limits for the run-time estimate: acceleration (mm/s²) and
+    /// rapid (G0) rate (mm/min).
+    pub max_accel: f64,
+    pub rapid_rate: f64,
+
     pub coolant: bool,
     /// Emit G43 H<n> after each tool change.
     pub tool_length_comp: bool,
@@ -359,6 +364,8 @@ impl Default for Settings {
             plunge_feed: 150.0,
             bore_stepover_pct: 40.0,
             thread_feed: 100.0,
+            max_accel: 200.0,
+            rapid_rate: 3000.0,
             coolant: true,
             tool_length_comp: true,
             cutters: Cutter::DEFAULTS.to_vec(),

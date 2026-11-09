@@ -7,6 +7,8 @@ Generates G-code to helically bore holes and then thread-mill them (M2–M6).
 - **Thread Milling** tab: the *Thread Locations* table. Each group has a list of x,y locations,
   a thread size, a thread length (0–100 mm) and a hole-milling cutter.
 - **Tools & Settings** tab: Z heights, feeds/speeds, and the editable tool tables (end mills and the thread mill for each size). **Save settings… / Load settings…** store all of it as a JSON file.
+- **Fewer non-cutting moves** within each operation: holes are bored nearest-next and threaded in reverse (starting where boring ended), engraving goes to the nearest letter outline next and enters it at its nearest point, profiles and pockets start near where the tool is, and roughing cuts each layer's regions and outlines nearest-first. Roughing hops between cuts stay low (0.5 mm above the layer above) when they only pass over ground cleared on the layer above, instead of going up to the retract height.
+- **Estimated run time** is shown next to the G-code line count. Every move speeds up and slows down at the **max acceleration** (default 200 mm/s²) up to its feed, or the **rapid rate** (default 3000 mm/min) for G0; both are set on the Tools & Settings tab. Corners slow down as on a typical controller (junction deviation 0.01 mm), so smooth paths keep their speed. Tool changes and spindle spin-up are not counted.
 - Hole depth = thread length + 1 pitch. Threads are milled bottom-up (G03, climb) from
   Z = top − length, so they stop one pitch above the bottom of the hole.
 - Tools (defaults, all editable): cutters T1–T5 (1x3, 1.5x6, 2x12, 3x17, 3.175x17), thread mills T11–T16 (M2…M6), engraving bits T21–T23 (tapered: 30° / 60° / 90° included angle with a 0.1 / 0.2 / 0.3 mm tip flat, each with a max depth). Add, remove and renumber end mills or change their Ø / flute length; groups and operations using a tool follow the edit. Tool numbers must be unique across both tables.
@@ -131,7 +133,11 @@ works layer by layer from the stock top (Start Z) down to the part bottom
 * Inside the part outline (seen from above) all material is cleared:
   pockets, holes and open steps such as the area above a flange. Open edges
   are cut right through, so no fin is left at the outline.
-* Outside the part nothing is cleared: the outside outline of the material
+* If the stock is taller than the part, roughing first faces the whole
+  stock top (with overlap past its edges, climb milled, in layer-height
+  steps) down to the part top + stock to leave; the layers below carry on
+  from there.
+* Outside the part nothing else is cleared: the outside outline of the material
   at that height is profiled once per layer (CW, climb), ramping down along
   the contour.
 * Sloped and curved surfaces are followed: at each layer only the part of

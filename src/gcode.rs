@@ -104,6 +104,8 @@ pub fn validate_settings(s: &Settings) -> Vec<Issue> {
         ("plunge feed", s.plunge_feed),
         ("bore stepover", s.bore_stepover_pct),
         ("thread feed", s.thread_feed),
+        ("max acceleration", s.max_accel),
+        ("rapid rate", s.rapid_rate),
     ] {
         if !(val > 0.0) {
             v.push(Issue::err(format!("{name} must be > 0")));
@@ -247,10 +249,30 @@ fn thread_hole(w: &mut Writer, s: &Settings, g: &ThreadGroup, tm: &ThreadMill, c
     w.line(format!("G0 Z{}", fmt(clear)));
 }
 
+/// Visit order for holes: from the first location, always the nearest
+/// unvisited one next. Boring runs in this order, threading in reverse (it
+/// starts at the hole the boring finished on).
+pub fn hole_order(locs: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut left: Vec<(f64, f64)> = locs.to_vec();
+    let mut out = Vec::with_capacity(left.len());
+    if left.is_empty() {
+        return out;
+    }
+    let mut here = left.remove(0);
+    out.push(here);
+    while !left.is_empty() {
+        let d = |p: &(f64, f64)| (p.0 - here.0).hypot(p.1 - here.1);
+        let k = (0..left.len()).min_by(|&a, &b| d(&left[a]).total_cmp(&d(&left[b]))).unwrap();
+        here = left.swap_remove(k);
+        out.push(here);
+    }
+    out
+}
+
 /// Helical boring of every location (no tool change), for other programs.
 pub fn bore_code(s: &Settings, g: &ThreadGroup, locs: &[(f64, f64)]) -> String {
     let mut w = Writer { out: String::new(), current_tool: None };
-    for &(x, y) in locs {
+    for (x, y) in hole_order(locs) {
         bore_hole(&mut w, s, g, x, y);
     }
     w.out
@@ -260,7 +282,7 @@ pub fn bore_code(s: &Settings, g: &ThreadGroup, locs: &[(f64, f64)]) -> String {
 pub fn thread_code(s: &Settings, g: &ThreadGroup, locs: &[(f64, f64)]) -> String {
     let mut w = Writer { out: String::new(), current_tool: None };
     let tm = s.thread_mill(g.thread);
-    for &(x, y) in locs {
+    for (x, y) in hole_order(locs).into_iter().rev() {
         thread_hole(&mut w, s, g, &tm, x, y);
     }
     w.out
@@ -336,7 +358,7 @@ pub fn generate(job: &Job) -> Result<String, Vec<String>> {
         let t = g.cutter.tool_number();
         w.tool_change(s, t, &format!("endmill Ø{}", fmt(g.cutter.dia())), s.spindle_rpm);
         w.line(format!("(group {} - bore)", i + 1));
-        for &(x, y) in locs {
+        for (x, y) in hole_order(locs) {
             bore_hole(&mut w, s, g, x, y);
         }
         w.line(format!("G0 Z{}", fmt(s.safe_z)));
@@ -350,7 +372,7 @@ pub fn generate(job: &Job) -> Result<String, Vec<String>> {
         let tm = s.thread_mill(g.thread);
         w.tool_change(s, t, &format!("thread mill {} Ø{}", g.thread.name(), fmt(tm.dia)), s.spindle_rpm);
         w.line(format!("(group {} - thread)", i + 1));
-        for &(x, y) in locs {
+        for (x, y) in hole_order(locs).into_iter().rev() {
             thread_hole(&mut w, s, g, &tm, x, y);
         }
         w.line(format!("G0 Z{}", fmt(s.safe_z)));

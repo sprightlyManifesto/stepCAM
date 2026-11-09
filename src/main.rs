@@ -1,6 +1,7 @@
 //! stepCAM - G-code generator for thread milling and 2.5D step milling.
 
 mod engrave;
+mod estimate;
 mod gcode;
 mod model;
 mod step;
@@ -53,6 +54,9 @@ struct StepCamApp {
     gcode: String,
     /// Errors from the last (automatic) generation.
     gen_errors: Vec<String>,
+    /// Estimated run time of `gcode` / `step_gcode` (s).
+    gcode_time: f64,
+    step_gcode_time: f64,
     /// Job the current G-code was generated from.
     generated_from: Option<Job>,
     toolpath: toolpath::Toolpath,
@@ -97,6 +101,8 @@ impl Default for StepCamApp {
             tab: Tab::StepMilling,
             gcode: String::new(),
             gen_errors: Vec::new(),
+            gcode_time: 0.0,
+            step_gcode_time: 0.0,
             generated_from: None,
             toolpath: Default::default(),
             view: Default::default(),
@@ -144,6 +150,8 @@ impl StepCamApp {
         match gcode::generate(&self.job) {
             Ok(code) => {
                 self.toolpath = toolpath::parse(&code);
+                let s = &self.job.settings;
+                self.gcode_time = estimate::estimate(&code, s.rapid_rate, s.max_accel);
                 self.gcode = code;
                 self.gen_errors.clear();
             }
@@ -179,6 +187,9 @@ impl StepCamApp {
             match &mut op.kind {
                 OpKind::Face(f) => f.region = region,
                 OpKind::Rough(r) => {
+                    if r.stock_region != region {
+                        r.stock_region = region;
+                    }
                     let f = self.rough_cache.as_ref().unwrap();
                     if &r.faces != f {
                         r.faces = f.clone();
@@ -254,6 +265,7 @@ impl StepCamApp {
         match stepmill::generate(&self.job.step, &settings) {
             Ok(code) => {
                 self.step_toolpath = toolpath::parse(&code);
+                self.step_gcode_time = estimate::estimate(&code, settings.rapid_rate, settings.max_accel);
                 self.step_gcode = code;
                 self.step_errors.clear();
             }
@@ -427,9 +439,18 @@ impl StepCamApp {
                 self.save_gcode();
             }
         });
-        let (code, errors) = if self.is_step_tab() { (&self.step_gcode, &self.step_errors) } else { (&self.gcode, &self.gen_errors) };
+        let (code, errors, secs) =
+            if self.is_step_tab() { (&self.step_gcode, &self.step_errors, self.step_gcode_time) } else { (&self.gcode, &self.gen_errors, self.gcode_time) };
         if errors.is_empty() {
-            ui.label(format!("G-code: {} lines (updates automatically)", code.lines().count()));
+            ui.horizontal(|ui| {
+                ui.label(format!("G-code: {} lines (updates automatically)", code.lines().count()));
+                ui.separator();
+                ui.strong(format!("Estimated run time {}", estimate::format_time(secs))).on_hover_text(format!(
+                    "Max acceleration {} mm/s², rapids at {} mm/min (Tools & Settings). Corners slow down as on a typical controller; tool changes and spindle spin-up are not counted.",
+                    gcode::fmt(self.job.settings.max_accel),
+                    gcode::fmt(self.job.settings.rapid_rate)
+                ));
+            });
         } else {
             ui.colored_label(ui.visuals().error_fg_color, format!("Cannot generate G-code:\n  {}", errors.join("\n  ")));
         }
@@ -768,7 +789,9 @@ impl StepCamApp {
 
     fn add_rough_op(&mut self) {
         let (Some(model), Some((_, smax))) = (&self.step_model, self.stock_box()) else { return };
+        let (smin, _) = self.stock_box().unwrap();
         let mut op = RoughOp {
+            stock_region: [smin[0], smin[1], smax[0], smax[1]],
             start_z: smax[2],
             bottom_z: model.min[2],
             faces: stepmill::rough_faces(model),
@@ -943,6 +966,8 @@ impl StepCamApp {
                 row(ui, "Clearance above hole start Z (between holes)", &mut s.clearance, 0.1, " mm");
                 row(ui, "Plunge feed", &mut s.plunge_feed, 1.0, " mm/min");
                 row(ui, "Boring ring stepover (% of cutter Ø)", &mut s.bore_stepover_pct, 0.5, " %");
+                row(ui, "Max acceleration (run-time estimate)", &mut s.max_accel, 1.0, " mm/s²");
+                row(ui, "Rapid rate G0 (run-time estimate)", &mut s.rapid_rate, 10.0, " mm/min");
                 ui.label("Coolant (M8)");
                 ui.checkbox(&mut s.coolant, "");
                 ui.end_row();
@@ -1849,6 +1874,13 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
             num(ui, "Overcut Z", &mut r.overcut_z, 0.05, " mm", "Keep going this far below Bottom Z (e.g. to cut through the part)");
             ui.label("Layers");
             ui.label(format!("{}", stepmill::rough_levels(r).len()));
+            ui.end_row();
+            ui.label("Stock facing");
+            match r.facing_z() {
+                Some(z) => ui.label(format!("whole stock from Z{} to Z{} first", gcode::fmt(r.start_z), gcode::fmt(z))),
+                None => ui.weak("none - stock is not above the part top + stock to leave"),
+            }
+            .on_hover_text("When the stock is taller than the part, roughing first faces the whole stock (with overlap past its edges) down to the part top + stock to leave, in layer-height steps");
             ui.end_row();
         }
         OpKind::Engrave(g) => {
