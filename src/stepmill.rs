@@ -1597,6 +1597,118 @@ fn apply_tab(moves: &[Mv], start: P3, tab: &MillTab, tool_r: f64) -> Vec<Mv> {
     out
 }
 
+// ------------------------------------------------------------------ threaded holes
+/// The volume of a thread-milled hole (thread major Ø, hole start Z down to
+/// the hole bottom): no other operation may cut into it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Keepout {
+    pub c: P2,
+    pub r: f64,
+    pub top: f64,
+    pub bottom: f64,
+}
+
+impl Keepout {
+    /// A polygon just outside the circle (circumscribed), CCW.
+    fn polygon(&self, grow: f64) -> Vec<P2> {
+        let n = 48;
+        let r = (self.r + grow) / (PI / n as f64).cos();
+        (0..n).map(|i| {
+            let a = TAU * i as f64 / n as f64;
+            [self.c[0] + r * a.cos(), self.c[1] + r * a.sin()]
+        }).collect()
+    }
+}
+
+/// Keep-out volumes of all enabled thread milling items.
+pub fn keepouts(job: &StepJob) -> Vec<Keepout> {
+    job.ops
+        .iter()
+        .filter(|o| o.enabled)
+        .filter_map(|o| if let OpKind::Thread(t) = &o.kind { Some(&t.group) } else { None })
+        .flat_map(|g| {
+            let (r, top, bottom) = (g.thread.major_dia() / 2.0, g.start_z, g.start_z - g.hole_depth());
+            g.parse_locations().unwrap_or_default().into_iter().map(move |(x, y)| Keepout { c: [x, y], r, top, bottom })
+        })
+        .collect()
+}
+
+/// Roughing that treats every threaded hole as solid below its top.
+fn rough_with_keepouts(op: &RoughOp, ks: &[Keepout]) -> RoughOp {
+    let mut op = op.clone();
+    for k in ks {
+        op.faces.push(RoughFace { z: k.top, outer: k.polygon(0.0), holes: vec![], tris: vec![], curved: false });
+    }
+    op
+}
+
+/// A pocket with the threaded holes inside it (and below its start) as
+/// islands, so the clearing goes round them.
+fn pocket_with_keepouts(op: &PocketOp, ks: &[Keepout]) -> PocketOp {
+    let mut op = op.clone();
+    for k in ks {
+        let poly = k.polygon(0.0);
+        let inner = inside(&[op.outer.clone()], k.c) && boundary_dist(&[op.outer.clone()], k.c) > k.r + 1e-3;
+        if k.top > op.z + 1e-6 && k.bottom < op.start_z && inner {
+            if !op.keep_islands {
+                op.islands.clear();
+                op.islands_z.clear();
+                op.keep_islands = true;
+            }
+            op.islands.push(poly);
+            op.islands_z.push(k.bottom);
+        }
+    }
+    op
+}
+
+/// Lift moves over a threaded hole: wherever the cutter (radius `tool_r`)
+/// would reach into the hole below its top, it goes over at the top instead.
+fn apply_keepout(moves: &[Mv], start: P3, k: &Keepout, tool_r: f64) -> Vec<Mv> {
+    let rr = k.r + tool_r;
+    let inside = |p: P3| (p[0] - k.c[0]).hypot(p[1] - k.c[1]) < rr;
+    let lift = |p: P3| if inside(p) { [p[0], p[1], p[2].max(k.top)] } else { p };
+    let mut out = Vec::with_capacity(moves.len());
+    let mut pos = start;
+    for &m in moves {
+        match m {
+            Mv::Rapid(p) => {
+                out.push(Mv::Rapid(lift(p)));
+                pos = p;
+            }
+            Mv::Feed(p, f) => {
+                let a = pos;
+                let (dx, dy) = (p[0] - a[0], p[1] - a[1]);
+                let (fx, fy) = (a[0] - k.c[0], a[1] - k.c[1]);
+                let qa = dx * dx + dy * dy;
+                let qb = 2.0 * (fx * dx + fy * dy);
+                let qc = fx * fx + fy * fy - rr * rr;
+                let disc = qb * qb - 4.0 * qa * qc;
+                let at = |t: f64| [a[0] + (p[0] - a[0]) * t, a[1] + (p[1] - a[1]) * t, a[2] + (p[2] - a[2]) * t];
+                if qa > 1e-18 && disc > 0.0 && (a[2] < k.top || p[2] < k.top) {
+                    let sq = disc.sqrt();
+                    let (t0, t1) = (((-qb - sq) / (2.0 * qa)).max(0.0), ((-qb + sq) / (2.0 * qa)).min(1.0));
+                    if t0 < t1 {
+                        if t0 > 1e-9 {
+                            let q = at(t0);
+                            out.push(Mv::Feed(q, f));
+                            out.push(Mv::Feed([q[0], q[1], q[2].max(k.top)], f));
+                        }
+                        if t1 < 1.0 - 1e-9 {
+                            let q = at(t1);
+                            out.push(Mv::Feed([q[0], q[1], q[2].max(k.top)], f));
+                            out.push(Mv::Feed(q, f));
+                        }
+                    }
+                }
+                out.push(Mv::Feed(lift(p), f));
+                pos = p;
+            }
+        }
+    }
+    out
+}
+
 // ------------------------------------------------------------------ validation & output
 pub fn validate(op: &StepOp, s: &Settings, tabs_top: f64) -> Vec<String> {
     let mut e = vec![];
@@ -1710,6 +1822,7 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
         .filter_map(|o| if let OpKind::Tab(t) = &o.kind { Some(t) } else { None })
         .collect();
     let tabs_top = tabs.iter().map(|t| t.top()).fold(f64::NEG_INFINITY, f64::max);
+    let holes = keepouts(job);
     let mut errors = vec![];
     for (i, op) in job.ops.iter().enumerate().filter(|(_, o)| o.enabled) {
         for e in validate(op, s, tabs_top) {
@@ -1772,11 +1885,11 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
         let retract = start_z.max(tabs_top) + s.clearance;
         let mut moves = match &op.kind {
             OpKind::Face(f) => face_moves(f, retract),
-            OpKind::Pocket(p) => match pocket_moves(p, retract) {
+            OpKind::Pocket(p) => match pocket_moves(&pocket_with_keepouts(p, &holes), retract) {
                 Ok(m) => m,
                 Err(e) => return Err(vec![format!("op {}: {e}", i + 1)]),
             },
-            OpKind::Rough(r) => match rough_moves(r, retract) {
+            OpKind::Rough(r) => match rough_moves(&rough_with_keepouts(r, &holes), retract) {
                 Ok(m) => m,
                 Err(e) => return Err(vec![format!("op {}: {e}", i + 1)]),
             },
@@ -1794,6 +1907,10 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
             Some(Mv::Rapid(p)) | Some(Mv::Feed(p, _)) => [p[0], p[1], s.safe_z],
             None => continue,
         };
+        // threaded holes are left to their thread milling item
+        for k in &holes {
+            moves = apply_keepout(&moves, start, k, tool_r);
+        }
         for t in &tabs {
             moves = apply_tab(&moves, start, t, tool_r);
         }
@@ -2611,3 +2728,96 @@ mod rough_curved_tests {
     }
 }
 
+
+#[cfg(test)]
+mod keepout_tests {
+    use super::*;
+    use crate::model::{ThreadGroup, ThreadSize};
+    use crate::toolpath;
+
+    fn thread_at(x: f64, y: f64, start_z: f64, thread: ThreadSize, length: f64) -> StepOp {
+        StepOp {
+            enabled: true,
+            kind: OpKind::Thread(ThreadOp {
+                faces: vec![],
+                group: ThreadGroup { thread, start_z, length, cutter: Cutter::C2x12, locations: format!("{x}, {y}\n"), ..Default::default() },
+            }),
+        }
+    }
+
+    /// Feed paths of one op; each path is a run of connected feed moves.
+    fn feeds(job: &StepJob, op_index: usize) -> Vec<Vec<[f64; 3]>> {
+        // feed moves of one op only: generate a job with just that op + the thread items
+        let mut j = job.clone();
+        for (i, o) in j.ops.iter_mut().enumerate() {
+            if i != op_index && !matches!(o.kind, OpKind::Thread(_)) {
+                o.enabled = false;
+            }
+        }
+        let mut s = Settings { safe_z: 15.0, ..Default::default() };
+        s.thread_mills.iter_mut().for_each(|t| t.reach = 50.0);
+        let code = generate(&j, &s).unwrap();
+        // drop the thread item's own moves: they follow the "- bore" comment
+        let cut = code.split("- bore)").next().unwrap();
+        let tp = toolpath::parse(cut);
+        tp.paths.iter().filter(|p| p.kind != toolpath::MoveKind::Rapid).map(|p| p.pts.iter().map(|q| [q[0] as f64, q[1] as f64, q[2] as f64]).collect()).collect()
+    }
+
+    /// Every point along the feed moves within `rr` of `c` is at or above `top`;
+    /// returns whether any move passed over that circle.
+    fn assert_clear(paths: &[Vec<[f64; 3]>], c: P2, rr: f64, top: f64) -> bool {
+        let mut over = false;
+        for path in paths {
+            for w in path.windows(2) {
+                for k in 0..=20 {
+                    let t = k as f64 / 20.0;
+                    let q = [0, 1, 2].map(|i| w[0][i] + (w[1][i] - w[0][i]) * t);
+                    if (q[0] - c[0]).hypot(q[1] - c[1]) < rr - 1e-3 {
+                        assert!(q[2] >= top - 1e-6, "cut into the threaded hole at {q:?}");
+                        over = true;
+                    }
+                }
+            }
+        }
+        over
+    }
+
+    #[test]
+    fn roughing_leaves_threaded_hole_alone() {
+        let m = crate::step::parse_model(include_str!("../testdata/pocket_block.step")).unwrap();
+        let rough = RoughOp { cutter: Cutter::C3x17, start_z: 1.0, bottom_z: m.min[2], faces: rough_faces(&m), ..Default::default() };
+        // thread item listed after the roughing
+        let job = StepJob { ops: vec![StepOp { enabled: true, kind: OpKind::Rough(rough) }, thread_at(52.0, 32.0, 0.0, ThreadSize::M6, 2.0)], ..Default::default() };
+        let paths = feeds(&job, 0);
+        // major radius + tool radius + stock to leave
+        assert_clear(&paths, [52.0, 32.0], 3.0 + 1.5 + 0.2, 0.0);
+        // the pocket next to it is still roughed
+        assert!(paths.iter().flatten().any(|p| p[2] < -3.0 && p[0] > 15.0 && p[0] < 45.0));
+    }
+
+    #[test]
+    fn pocket_goes_round_threaded_hole() {
+        let pocket = PocketOp { z: -4.0, start_z: 0.0, outer: vec![[15.0, 10.0], [45.0, 10.0], [45.0, 30.0], [15.0, 30.0]], cutter: Cutter::C3x17, ..Default::default() };
+        let job = StepJob { ops: vec![StepOp { enabled: true, kind: OpKind::Pocket(pocket) }, thread_at(30.0, 20.0, 0.0, ThreadSize::M3, 6.0)], ..Default::default() };
+        let paths = feeds(&job, 0);
+        assert_clear(&paths, [30.0, 20.0], 1.5 + 1.5, 0.0);
+        assert!(paths.iter().flatten().any(|p| (p[2] + 4.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn other_cuts_lift_over_threaded_hole() {
+        let face = FaceOp { z: -1.0, start_z: 0.0, region: [0.0, 0.0, 60.0, 40.0], cutter: Cutter::C3x17, ..Default::default() };
+        // thread item first this time
+        let job = StepJob { ops: vec![thread_at(30.0, 20.0, 0.0, ThreadSize::M5, 5.0), StepOp { enabled: true, kind: OpKind::Face(face) }], ..Default::default() };
+        let mut j = job.clone();
+        j.ops.swap(0, 1);
+        let paths = feeds(&j, 0);
+        assert!(assert_clear(&paths, [30.0, 20.0], 2.5 + 1.5, 0.0), "facing never passed over the hole");
+        assert!(paths.iter().flatten().any(|p| (p[2] + 1.0).abs() < 1e-6));
+        // same result with the thread item first in the list
+        let code_a = generate(&job, &Settings { safe_z: 15.0, ..Default::default() }).unwrap();
+        let code_b = generate(&j, &Settings { safe_z: 15.0, ..Default::default() }).unwrap();
+        let body = |c: &str| c.lines().filter(|l| !l.starts_with("(op")).filter(|l| l.starts_with('G')).filter(|l| !l.contains('I')).count();
+        assert_eq!(body(&code_a), body(&code_b));
+    }
+}

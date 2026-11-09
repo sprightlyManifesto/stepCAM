@@ -28,6 +28,7 @@ __pycache__/
 .venv/
 
 # Editors / IDEs
+.claude/settings.local.json
 .vscode/
 .idea/
 *.swp

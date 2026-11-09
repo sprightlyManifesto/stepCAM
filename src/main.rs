@@ -94,7 +94,7 @@ impl Default for StepCamApp {
         });
         StepCamApp {
             job,
-            tab: Tab::ThreadMilling,
+            tab: Tab::StepMilling,
             gcode: String::new(),
             gen_errors: Vec::new(),
             generated_from: None,
@@ -1300,6 +1300,27 @@ fn holes_of(model: &step::Model, faces: &[usize]) -> Vec<Hole> {
 /// How close a modelled hole must be to a size's tap-drill or major diameter.
 const THREAD_DIA_TOL: f64 = 0.3;
 
+/// Every threadable hole in the model like the one face `fi` belongs to (same
+/// Ø, depth and blind / through), less the holes that already have a thread
+/// milling item; also returns how many alike holes were already threaded.
+fn alike_holes(model: &step::Model, fi: usize, ops: &[StepOp]) -> (Vec<Hole>, usize) {
+    let Some(h0) = holes_of(model, &coaxial_faces(model, fi)).into_iter().next() else { return (vec![], 0) };
+    if hole_problem(&h0).is_some() {
+        return (vec![], 0);
+    }
+    let threaded: Vec<usize> = ops.iter().filter_map(|o| if let OpKind::Thread(t) = &o.kind { Some(t.faces.iter().copied()) } else { None }).flatten().collect();
+    let all: Vec<usize> = (0..model.faces.len()).filter(|&k| model.faces[k].cyl.is_some()).collect();
+    let alike: Vec<Hole> = holes_of(model, &all)
+        .into_iter()
+        .filter(|h| hole_problem(h).is_none())
+        .filter(|h| (h.dia - h0.dia).abs() < 1e-3 && ((h.top - h.bottom) - (h0.top - h0.bottom)).abs() < 1e-3 && h.blind == h0.blind)
+        .collect();
+    let n = alike.len();
+    let fresh: Vec<Hole> = alike.into_iter().filter(|h| !h.faces.iter().any(|f| threaded.contains(f))).collect();
+    let done = n - fresh.len();
+    (fresh, done)
+}
+
 /// Thread size for a modelled hole: the closest tap-drill or major diameter,
 /// a tap-drill match winning a tie (Ø5 = M6 tap drill, not M5 major).
 /// None when no size is within THREAD_DIA_TOL.
@@ -1580,6 +1601,24 @@ fn context_menu(
                     .clicked()
                 {
                     for op in thread_ops(&holes, settings) {
+                        ops.push(StepOp { enabled: true, kind: OpKind::Thread(op) });
+                    }
+                    ui.close_menu();
+                }
+                // every hole like this one in the model
+                let (alike, done) = if why.is_none() { alike_holes(model, *fi, ops) } else { (vec![], 0) };
+                let label = format!("Thread mill all alike holes ({} hole{})", alike.len(), if alike.len() == 1 { "" } else { "s" });
+                if ui
+                    .add_enabled(!alike.is_empty(), egui::Button::new(label))
+                    .on_hover_text(format!(
+                        "Bore and thread mill every hole in the model with this one's Ø{} and depth{}",
+                        gcode::fmt(c.r * 2.0),
+                        if done > 0 { format!(" ({done} already have a thread milling item)") } else { String::new() }
+                    ))
+                    .on_disabled_hover_text(why.clone().unwrap_or_else(|| "All alike holes already have a thread milling item".into()))
+                    .clicked()
+                {
+                    for op in thread_ops(&alike, settings) {
                         ops.push(StepOp { enabled: true, kind: OpKind::Thread(op) });
                     }
                     ui.close_menu();
@@ -2121,5 +2160,64 @@ mod hole_filter_tests {
         let s = Settings::default();
         assert!(thread_ops(&[hole(29.0, full), hole(5.0, 0b1111)], &s).is_empty());
         assert_eq!(thread_ops(&[hole(5.0, full), hole(2.5, full)], &s).len(), 2); // M6 and M3 items
+    }
+}
+
+#[cfg(test)]
+mod alike_tests {
+    use super::*;
+
+    /// Two Ø5 x 6 blind holes, one Ø5 x 4 and one Ø3 x 6 hole, as faces of a
+    /// minimal model (wall cylinders plus a floor under each).
+    fn model() -> step::Model {
+        let mut m = step::Model::default();
+        let mut add = |x: f64, y: f64, r: f64, depth: f64| {
+            let circle = |z: f64| (0..72).map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / 72.0;
+                [x + r * a.cos(), y + r * a.sin(), z]
+            }).collect::<Vec<_>>();
+            let (e_top, e_bot) = (m.edges.len(), m.edges.len() + 1);
+            let wall = m.faces.len();
+            m.edges.push(step::Edge { pts: circle(0.0), faces: vec![wall] });
+            m.edges.push(step::Edge { pts: circle(-depth), faces: vec![wall, wall + 1] });
+            let lp = |e: usize, pts: Vec<[f64; 3]>| step::Loop { outer: true, edges: vec![e], pts };
+            m.faces.push(step::Face {
+                planar: false,
+                normal: [0.0; 3],
+                origin: [x, y, 0.0],
+                loops: vec![lp(e_top, circle(0.0)), lp(e_bot, circle(-depth))],
+                tris: vec![],
+                cyl: Some(step::Cyl { origin: [x, y, 0.0], axis: [0.0, 0.0, 1.0], r, hole: true }),
+            });
+            // floor facing up: blind
+            m.faces.push(step::Face { planar: true, normal: [0.0, 0.0, 1.0], origin: [x, y, -depth], loops: vec![lp(e_bot, circle(-depth))], tris: vec![], cyl: None });
+            wall
+        };
+        add(10.0, 10.0, 2.5, 6.0);
+        add(30.0, 10.0, 2.5, 6.0);
+        add(50.0, 10.0, 2.5, 4.0);
+        add(70.0, 10.0, 1.5, 6.0);
+        m
+    }
+
+    #[test]
+    fn finds_alike_holes_and_skips_threaded_ones() {
+        let m = model();
+        let (holes, done) = alike_holes(&m, 0, &[]);
+        assert_eq!(done, 0);
+        let mut at: Vec<(f64, f64)> = holes.iter().map(|h| (h.x, h.y)).collect();
+        at.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(at, vec![(10.0, 10.0), (30.0, 10.0)]);
+        let ops = thread_ops(&holes, &Settings::default());
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].group.parse_locations().unwrap().len(), 2);
+        // once threaded, right-clicking either hole finds nothing new
+        let list = vec![StepOp { enabled: true, kind: OpKind::Thread(ops[0].clone()) }];
+        let (again, done) = alike_holes(&m, 2, &list);
+        assert!(again.is_empty() && done == 2);
+        // the Ø3 hole is alike only to itself
+        let (small, _) = alike_holes(&m, 6, &[]);
+        assert_eq!(small.len(), 1);
+        assert_eq!(thread_ops(&small, &Settings::default())[0].group.thread, ThreadSize::M3);
     }
 }

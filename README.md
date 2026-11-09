@@ -36,8 +36,15 @@ Generates G-code to helically bore holes and then thread-mill them (M2–M6).
     of the hole, the size from the closest tap-drill or major Ø (M2–M6, within 0.3 mm; a tap-drill
     match wins, so Ø5 is M6), and the length from the modelled depth (blind holes: depth − 1 pitch,
     so the hole depth matches; through holes: the full depth). Holes of different size, top or
-    depth become separate items. Only full, vertical holes qualify - not bosses, slot ends, corner
+    depth become separate items. **Thread mill all alike holes** (same menu) does the same for
+    every hole in the model with the right-clicked hole's Ø, depth and blind / through type,
+    skipping holes that already have a thread milling item. Only full, vertical holes qualify - not bosses, slot ends, corner
     fillets or bores of other sizes. Mill tabs are not applied to these cycles.
+    Every other operation leaves a thread-milled hole alone, wherever the items are in the list:
+    its volume (thread major Ø, from the hole start Z down to the hole bottom) counts as solid for
+    Rough, is an island in Pockets that contain it, and any other cut that would reach into it
+    lifts over it at the hole start Z (like a mill tab). Untick the thread item to cut the hole
+    with the other operations again.
   - any edge → **Add mill tab** (rectangle: width along the edge tangent, depth across it, Z height up
     from the edge). Every cut lifts over the tab, allowing for the cutter radius.
 - Pocket strategies: **Standard** (offset passes) or **Adaptive clearing** (trochoidal loops). Entry styles:
