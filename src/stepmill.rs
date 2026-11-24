@@ -710,6 +710,26 @@ fn point_at(p: &[P2], mut s: f64) -> P2 {
     *p.last().unwrap()
 }
 
+/// Arc-length stations along `p` from s0 to s1 (either direction): the
+/// path's own vertices strictly between them, then s1. Following these
+/// keeps a move on the path instead of cutting across its corners.
+fn stations(p: &[P2], s0: f64, s1: f64) -> Vec<f64> {
+    let (lo, hi) = (s0.min(s1), s0.max(s1));
+    let mut acc = 0.0;
+    let mut mid: Vec<f64> = vec![];
+    for w in p.windows(2) {
+        acc += d2(w[0], w[1]);
+        if acc > lo + 1e-9 && acc < hi - 1e-9 {
+            mid.push(acc);
+        }
+    }
+    if s1 < s0 {
+        mid.reverse();
+    }
+    mid.push(s1);
+    mid
+}
+
 /// Trochoidal path along a closed centre path (already closed).
 fn trochoid(center: &[P2], radius: f64, advance: f64) -> Vec<P2> {
     let l = path_len(center);
@@ -825,31 +845,29 @@ impl PocketCtx<'_> {
                 while z > z_to + 1e-9 {
                     let (s_next, len) = if forward { (lz, lz - s) } else { (0.0, s) };
                     let dz = len * tan;
-                    if z - dz <= z_to {
+                    // follow the path's own vertices (never across its corners),
+                    // descending in proportion to the distance along it
+                    let (s_end, z_end) = if z - dz <= z_to {
                         // reach depth part way along this pass
-                        let frac = (z - z_to) / dz;
-                        let s_end = s + (s_next - s) * frac;
-                        let p = point_at(path, s_end);
-                        out.feed([p[0], p[1], z_to], op.feed);
-                        s = s_end;
-                        z = z_to;
+                        (s + (s_next - s) * (z - z_to) / dz, z_to)
                     } else {
-                        // follow the path between s and s_next with intermediate vertices
-                        let steps = ((len / (op.cutter.dia() * 0.5).max(0.2)).ceil() as usize).max(1);
-                        for k in 1..=steps {
-                            let ss = s + (s_next - s) * k as f64 / steps as f64;
-                            let p = point_at(path, ss);
-                            out.feed([p[0], p[1], z - dz * k as f64 / steps as f64], op.feed);
-                        }
-                        z -= dz;
-                        s = s_next;
+                        (s_next, z - dz)
+                    };
+                    let span = s_end - s;
+                    for ss in stations(path, s, s_end) {
+                        let f = if span.abs() > 1e-12 { (ss - s) / span } else { 1.0 };
+                        let p = point_at(path, ss);
+                        out.feed([p[0], p[1], z + (z_end - z) * f], op.feed);
+                    }
+                    if z_end > z_to {
                         forward = !forward;
                     }
+                    z = z_end;
+                    s = s_end;
                 }
                 // back to the path start at depth
-                let steps = ((s / (op.cutter.dia() * 0.5).max(0.2)).ceil() as usize).max(1);
-                for k in 1..=steps {
-                    let p = point_at(path, s * (1.0 - k as f64 / steps as f64));
+                for ss in stations(path, s, 0.0) {
+                    let p = point_at(path, ss);
                     out.feed([p[0], p[1], z_to], op.feed);
                 }
                 return;
@@ -3432,3 +3450,4 @@ mod facing_outline_tests {
         assert!(moves.iter().any(|m| matches!(m, Mv::Feed(p, _) if p[0] < 10.0 && p[2].abs() < 1e-9)));
     }
 }
+

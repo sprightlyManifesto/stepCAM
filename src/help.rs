@@ -3,7 +3,8 @@
 //!
 //! Renders the Markdown subset the guide uses: `#` headings, paragraphs,
 //! `-` / `1.` lists (nested by indent, with indented continuation
-//! paragraphs), pipe tables, `**bold**`, `*italic*` and `` `code` ``.
+//! paragraphs), pipe tables, ``` code blocks, `**bold**`, `*italic*` and
+//! `` `code` ``.
 
 use eframe::egui::{self, text::LayoutJob, Color32, FontId, TextFormat};
 
@@ -25,6 +26,8 @@ enum Block {
     List(Vec<(usize, Marker, String)>),
     /// Header row, body rows.
     Table(Vec<String>, Vec<Vec<String>>),
+    /// Fenced code block, lines as written.
+    Code(String),
 }
 
 fn list_item(line: &str) -> Option<(usize, Marker, String)> {
@@ -57,8 +60,23 @@ fn parse(md: &str) -> Vec<Block> {
             para.clear();
         }
     };
+    let mut code: Option<Vec<&str>> = None;
     for line in md.lines() {
         let t = line.trim();
+        if t.starts_with("```") {
+            match code.take() {
+                Some(c) => out.push(Block::Code(c.join("\n"))),
+                None => {
+                    flush(&mut para, &mut out);
+                    code = Some(vec![]);
+                }
+            }
+            continue;
+        }
+        if let Some(c) = &mut code {
+            c.push(line);
+            continue;
+        }
         if t.is_empty() {
             flush(&mut para, &mut out);
             blank = true;
@@ -199,6 +217,7 @@ impl Help {
                 Block::Heading(_, t) | Block::Para(t) => s += t,
                 Block::List(items) => items.iter().for_each(|i| s += &i.2),
                 Block::Table(head, body) => head.iter().chain(body.iter().flatten()).for_each(|c| s += c),
+                Block::Code(c) => s += c,
             }
             s.push(' ');
         }
@@ -298,6 +317,13 @@ impl Help {
                         });
                     }
                 }
+                Block::Code(c) => {
+                    ui.add_space(4.0);
+                    egui::Frame::none().fill(ui.visuals().code_bg_color).inner_margin(8.0).rounding(4.0).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.label(egui::RichText::new(c).monospace().size(body * 0.92));
+                    });
+                }
                 Block::Table(head, rows) => {
                     ui.add_space(4.0);
                     egui::Grid::new(("help_table", bi)).striped(true).spacing([18.0, 4.0]).show(ui, |ui| {
@@ -337,6 +363,8 @@ mod tests {
         assert_eq!(items[4], (0, Marker::Number("1".into()), "first".into()));
         assert_eq!(b[3], Block::Table(vec!["A".into(), "B".into()], vec![vec!["x".into(), "y".into()], vec!["z".into(), "w".into()]]));
         assert_eq!(b[4], Block::Para("After.".into()));
+        let b = parse("Text\n```\nx = 1\n  - not a list\n```\nMore\n");
+        assert_eq!(b, vec![Block::Para("Text".into()), Block::Code("x = 1\n  - not a list".into()), Block::Para("More".into())]);
     }
 
     #[test]

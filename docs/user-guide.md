@@ -332,6 +332,110 @@ Problems are listed as the simulation reaches them. Press ⏭ to find them all, 
 - Engraving bits are drawn with a 1/8" shank.
 - Tool holders are not checked.
 
+## Scripting from CadQuery
+
+`python/stepcam.py` lets a CadQuery script build a step milling job. Faces and edges are chosen with CadQuery selectors instead of mouse clicks. Each operation is made exactly as the right-click menu would make it, so the defaults are the same, and the job opens in the app afterwards.
+
+### Setting up
+
+1. Build stepCAM: `cargo build --release`.
+2. Make `stepcam.py` importable: copy it next to your script, add the `python/` folder to `PYTHONPATH`, or use `sys.path.insert`.
+3. The module finds the `stepcam` program in this order:
+   - the `binary=` argument;
+   - the `STEPCAM` environment variable;
+   - `stepcam` on the PATH;
+   - the repository's own `target/release` build.
+
+### Example
+
+```
+import cadquery as cq
+from stepcam import Job
+
+part = (cq.Workplane().rect(50, 30).extrude(8)
+        .faces(">Z").workplane().rect(30, 14).cutBlind(-4))
+
+job = Job(part, stock=(6, 6, 1))        # 3 mm per side, 1 mm on top
+job.rough(tool=4, stock_to_leave=0.15)
+job.face(">Z")
+job.pocket(part.faces(">Z[-2]"), tool=3)
+job.profile(part.faces("<Z"), side="outside", bottom_z=-0.2)
+job.tabs(part.faces("<Z").edges("|X"), at=(0.25, 0.75), width=5, height=1.5)
+res = job.generate("bracket.nc", simulate=True)
+print(res.run_time_text, res.simulation["max_gouge"])
+job.open()                               # look at it in stepCAM
+```
+
+`python/example.py` is a complete example with threads and engraving.
+
+### The job
+
+`Job(part, stock=(x, y, z), stock_offset=True, rapid_above=10, settings_file=None, settings=None)`
+
+- **part:** a CadQuery Workplane or Shape, in machine coordinates. Move and rotate it in CadQuery to place it on the machine.
+- **stock:** with `stock_offset=True`, the values are added to the part's bounding box. With `False`, they are the absolute stock size. This is the same as the Stock inputs on the Step Milling tab.
+- **settings_file:** a settings file saved from Tools & Settings, holding your tool table.
+- **settings:** overrides by name, for example `{"spindle_rpm": 12000, "coolant": False}`.
+
+### Operations
+
+Each method takes a selection: a selector string applied to the part (such as `">Z"`), a Workplane, a Shape, or a list of them. They are added to the job in the order you call them.
+
+- `job.rough(**params)`
+- `job.face(faces=">Z", **params)`: one Face per flat, up-facing face.
+- `job.pocket(faces_or_edges, **params)`:
+  - faces: flat or sloped faces that face up;
+  - edges: closed, level loops, one pocket per loop.
+- `job.profile(edges, side="outside", **params)`: one profile per edge chain. A face selects its outline.
+- `job.engrave(face, text, at=(x, y), **params)`: `at` is the anchor point in machine coordinates.
+- `job.thread(holes, **params)`: the selected cylindrical holes, as **Add to thread milling**.
+- `job.thread_alike(hole, **params)`: every hole like the selected one, as **Thread mill all alike holes**.
+- `job.tabs(edges, at=0.5, **params)`: a mill tab on each selected edge, at the fraction `at` along it. Give a list, such as `at=(0.25, 0.75)`, for several tabs per edge.
+
+Every method also takes `enabled=False`, which adds the operation switched off.
+
+**Parameters** use the field names shown in the app. These are accepted:
+
+- **All operations:** `tool` (a tool number), `feed`, `speed`, `start_z`, `depth_per_pass`, `stepover` (%), `ramp_angle`, `strategy` (`"standard"` / `"adaptive"`), `entry` (`"helix"` / `"zigzag"` / `"plunge"`).
+- **Rough:** `layer_height`, `stock_to_leave`, `bottom_z`, `overcut_z`, `clear_voids`.
+- **Face:** `extra` (past the outline).
+- **Pocket:** `finish` (the finish pass amount), `keep_islands`, `floor_z` (pockets made from edges).
+- **Profile:** `side` (`"outside"` / `"inside"` / `"center"`), `bottom_z`.
+- **Engrave:** `height`, `depth`, `font` (`"Sans"`, `"Mono"` or a font file), `align`, `valign`, `angle`, and `dx` / `dy` from the face centre instead of `at`.
+- **Thread:** `thread` (`"M3"`), `length`, `start_z`, `descent_angle`. Here `tool` is the boring end mill.
+- **Tabs:** `width` (along the edge), `depth` (across it), `height`.
+
+Field names as saved in a job file are accepted too. A misspelt name is an error that lists the valid ones.
+
+**Selector tips:**
+- `">Z"` is the highest face, and `">Z[-2]"` the second highest (`">Z[0]"` is the lowest).
+- `"%CYLINDER"` selects cylindrical faces, but fillets are cylinders too. Narrow the selection down, for example `part.faces("%CYLINDER").faces(">X")`.
+- `part.faces("<Z").edges("|X")` selects the bottom outline edges that run along X, which suits tabs.
+
+### Results
+
+`job.generate("part.nc", job=None, step=None, simulate=False)` writes three files:
+- the G-code;
+- `part.stepcam.json`, which you can open with **Load** in the app or with `job.open()`;
+- `part.step`, the exported model, which the job refers to.
+
+It returns a result with:
+- `ops` (the operation labels), `lines`, `run_time` (s) and `run_time_text`;
+- `warnings`, and `gcode` (the program text).
+
+With `simulate=True` (or `{"detail": 300, "tolerance": 0.02}`) the program also runs through the simulator, and `result.simulation` gives:
+- `removed_mm3` and `at_size_pct`;
+- `max_stock_left`, `max_gouge`, `max_gouge_at` and `gouged_cells`;
+- `events`: rapids through material and cuts deeper than the flutes, each with its line number.
+
+Threads and engraving count as gouges here, because the model has neither.
+
+If stepCAM can't build the job, for example because a selection isn't on a suitable face or a parameter is unknown, `generate()` raises `StepCamError` with the reasons. Pass `check=False` to get a result with `ok=False` and `errors` instead.
+
+### Without Python
+
+The module runs `stepcam batch spec.json`, which reads a JSON description of the job and prints a JSON report. Faces and edges in the description are given as points on the model. The format is described at the top of `src/batch.rs`. `stepcam part.stepcam.json` opens a job in the app.
+
 ## Tools & Settings tab
 
 ### Machining settings

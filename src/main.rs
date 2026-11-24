@@ -1,5 +1,6 @@
 //! stepCAM - G-code generator for thread milling and 2.5D step milling.
 
+mod batch;
 mod engrave;
 mod estimate;
 mod gcode;
@@ -20,13 +21,28 @@ use engrave::{EngraveOp, EngraveTool, HAlign, VAlign};
 use view3d::{ModelViz, Pick};
 
 fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // headless: `stepcam batch spec.json` (used by python/stepcam.py)
+    if args.first().map(String::as_str) == Some("batch") {
+        std::process::exit(batch::main(&args[1..]));
+    }
+    // `stepcam job.stepcam.json` opens that job
+    let job_arg = args.into_iter().find(|a| a.ends_with(".json"));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 850.0])
             .with_title("stepCAM"),
         ..Default::default()
     };
-    eframe::run_native("stepCAM", options, Box::new(|_cc| Ok(Box::new(StepCamApp::default()))))
+    eframe::run_native("stepCAM", options, Box::new(move |_cc| {
+        let mut app = StepCamApp::default();
+        if let Some(p) = job_arg {
+            app.job_path = p;
+            app.load_job();
+            app.tab = Tab::StepMilling;
+        }
+        Ok(Box::new(app))
+    }))
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -803,23 +819,10 @@ impl StepCamApp {
     }
 
     fn add_rough_op(&mut self) {
-        let (Some(model), Some((_, smax))) = (&self.step_model, self.stock_box()) else { return };
-        let (smin, _) = self.stock_box().unwrap();
-        let mut op = RoughOp {
-            stock_region: [smin[0], smin[1], smax[0], smax[1]],
-            start_z: smax[2],
-            bottom_z: model.min[2],
-            faces: stepmill::rough_faces(model),
-            ..Default::default()
-        };
-        let table = &self.job.settings.cutters;
-        if !table.iter().any(|t| t.id == op.cutter.id) {
-            if let Some(&best) = table.iter().min_by(|a, b| (a.dia - op.cutter.dia).abs().total_cmp(&(b.dia - op.cutter.dia).abs())) {
-                op.cutter = best;
-            }
-        }
+        let (Some(model), Some(stock)) = (&self.step_model, self.stock_box()) else { return };
+        let op = rough_op(model, stock, &self.job.settings);
         // roughing goes before the other cutting ops
-        let at = self.job.step.ops.iter().position(|o| !matches!(o.kind, OpKind::Tab(_) | OpKind::Rough(_))).unwrap_or(self.job.step.ops.len());
+        let at = rough_insert_at(&self.job.step.ops);
         self.job.step.ops.insert(at, StepOp { enabled: true, kind: OpKind::Rough(op) });
     }
 
@@ -1561,6 +1564,121 @@ fn refresh_ops(ops: &mut [StepOp], model: &step::Model, old: &step::Placement, n
 
 /// Right-click menu in the step milling view.
 #[allow(clippy::too_many_arguments)]
+/// Ops cutting from the part top start at the stock top instead.
+fn from_top(model: &step::Model, stock_top: f64, start: f64) -> f64 {
+    if start >= model.max[2] - 1e-6 {
+        start.max(stock_top)
+    } else {
+        start
+    }
+}
+
+/// Face op down to flat surface `fi`.
+fn face_op(model: &step::Model, fi: usize, stock_top: f64) -> FaceOp {
+    let z = model.faces[fi].z();
+    FaceOp {
+        face_id: fi,
+        z,
+        region: [model.min[0], model.min[1], model.max[0], model.max[1]],
+        outline: stepmill::part_outline(&stepmill::rough_faces(model)),
+        start_z: if stock_top > z + 1e-6 { stock_top } else { z + 1.0 },
+        ..Default::default()
+    }
+}
+
+/// Pocket bounded by the closed, level edge loop through `edge`.
+fn edge_pocket(model: &step::Model, edge: usize, stock_top: f64) -> Result<PocketOp, String> {
+    let (chain, closed) = model.edge_chain(edge);
+    let Some((outer, z)) = chain_outline(model, &chain) else { return Err("Edges must be level (constant Z)".into()) };
+    if !closed {
+        return Err("Needs a closed loop of edges".into());
+    }
+    let (bottom, start) = edge_depths(model, &chain, z);
+    Ok(PocketOp { face_id: usize::MAX, z: bottom, start_z: from_top(model, stock_top, start), outer, edges: chain, edge_z: z, ..Default::default() })
+}
+
+/// Profile along the level edge loop / chain through `edge`.
+fn edge_profile(model: &step::Model, edge: usize, stock_top: f64) -> Result<ProfileOp, String> {
+    let (chain, closed) = model.edge_chain(edge);
+    let Some((path, z)) = chain_outline(model, &chain) else { return Err("Edges must be level (constant Z)".into()) };
+    let (bottom, start) = edge_depths(model, &chain, z);
+    Ok(ProfileOp {
+        path,
+        closed,
+        edge_z: z,
+        side: if closed { ProfileSide::Outside } else { ProfileSide::Center },
+        z: bottom,
+        start_z: from_top(model, stock_top, start),
+        edges: chain,
+        ..Default::default()
+    })
+}
+
+/// Mill tab on `edge` at `point`, `angle` = edge tangent in XY (radians).
+fn mill_tab(model: &step::Model, edge: usize, point: [f64; 3], angle: f64) -> MillTab {
+    MillTab { center: point, angle, edges: model.edge_chain(edge).0, ..Default::default() }
+}
+
+/// Holes for "Add to thread milling" on cylinder face `fi` (plus the
+/// Ctrl-selected `sel_faces`): usable holes, why none can be used, and
+/// how many selected faces were skipped.
+struct HolePick {
+    holes: Vec<Hole>,
+    why: Option<String>,
+    skipped: usize,
+}
+
+fn pick_holes(model: &step::Model, fi: usize, sel_faces: &[usize]) -> HolePick {
+    let Some(c) = model.faces[fi].cyl.filter(|_| !model.faces[fi].planar) else {
+        return HolePick { holes: vec![], why: Some("Not a cylindrical surface".into()), skipped: 0 };
+    };
+    let mut faces: Vec<usize> = sel_faces.iter().copied().filter(|&g| model.faces.get(g).map_or(false, |g| g.cyl.is_some())).collect();
+    for g in coaxial_faces(model, fi) {
+        if !faces.contains(&g) {
+            faces.push(g);
+        }
+    }
+    let found = holes_of(model, &faces);
+    let problems: Vec<String> = found.iter().filter_map(hole_problem).collect();
+    let holes: Vec<Hole> = found.into_iter().filter(|h| hole_problem(h).is_none()).collect();
+    let why = if !c.hole {
+        Some("Only holes can be thread milled (this is the outside of a boss)".to_string())
+    } else if !c.vertical() {
+        Some("The hole's axis is not vertical - lay the model flat first".to_string())
+    } else if holes.is_empty() {
+        Some(problems.first().cloned().unwrap_or_else(|| "No vertical holes selected".into()))
+    } else {
+        None
+    };
+    let skipped = faces.iter().filter(|f| !holes.iter().any(|h| h.faces.contains(f))).count();
+    HolePick { holes, why, skipped }
+}
+
+/// Roughing for the whole part in `stock`, with the cutter nearest the
+/// default Ø from the tool table.
+fn rough_op(model: &step::Model, stock: ([f64; 3], [f64; 3]), settings: &Settings) -> RoughOp {
+    let (smin, smax) = stock;
+    let mut op = RoughOp {
+        stock_region: [smin[0], smin[1], smax[0], smax[1]],
+        start_z: smax[2],
+        bottom_z: model.min[2],
+        faces: stepmill::rough_faces(model),
+        ..Default::default()
+    };
+    let table = &settings.cutters;
+    if !table.iter().any(|t| t.id == op.cutter.id) {
+        if let Some(&best) = table.iter().min_by(|a, b| (a.dia - op.cutter.dia).abs().total_cmp(&(b.dia - op.cutter.dia).abs())) {
+            op.cutter = best;
+        }
+    }
+    op
+}
+
+/// Where a new roughing op goes: before the other cutting ops.
+fn rough_insert_at(ops: &[StepOp]) -> usize {
+    ops.iter().position(|o| !matches!(o.kind, OpKind::Tab(_) | OpKind::Rough(_))).unwrap_or(ops.len())
+}
+
 fn context_menu(
     ui: &mut egui::Ui,
     model: &step::Model,
@@ -1574,8 +1692,6 @@ fn context_menu(
     click: Option<[f64; 3]>,
     reading_angle: f64,
 ) -> Option<MenuAction> {
-    // ops cutting from the part top start at the stock top instead
-    let from_top = |start: f64| if start >= model.max[2] - 1e-6 { start.max(stock_top) } else { start };
     let mut action = None;
     // placement entries for any flat surface
     let placement_items = |ui: &mut egui::Ui, fi: usize, action: &mut Option<MenuAction>, set_z: &mut f64| {
@@ -1615,18 +1731,7 @@ fn context_menu(
                 ui.label(format!("Flat surface at Z{}", gcode::fmt(f.z())));
                 ui.separator();
                 if ui.button("Face").on_hover_text("Mill the whole part down to this surface").clicked() {
-                    let z = f.z();
-                    ops.push(StepOp {
-                        enabled: true,
-                        kind: OpKind::Face(FaceOp {
-                            face_id: *fi,
-                            z,
-                            region: [model.min[0], model.min[1], model.max[0], model.max[1]],
-                            outline: stepmill::part_outline(&stepmill::rough_faces(model)),
-                            start_z: if stock_top > z + 1e-6 { stock_top } else { z + 1.0 },
-                            ..Default::default()
-                        }),
-                    });
+                    ops.push(StepOp { enabled: true, kind: OpKind::Face(face_op(model, *fi, stock_top)) });
                     ui.close_menu();
                 }
                 if ui.button("Pocket").on_hover_text("Clear the material inside this surface's outer boundary down to it").clicked() {
@@ -1662,25 +1767,7 @@ fn context_menu(
                 ui.label(format!("Cylinder Ø{}{}", gcode::fmt(c.r * 2.0), if c.hole { " (hole)" } else { " (boss)" }));
                 ui.separator();
                 // the right-clicked hole plus any Ctrl-selected ones
-                let mut faces: Vec<usize> = sel_faces.iter().copied().filter(|&g| model.faces.get(g).map_or(false, |g| g.cyl.is_some())).collect();
-                for g in coaxial_faces(model, *fi) {
-                    if !faces.contains(&g) {
-                        faces.push(g);
-                    }
-                }
-                let found = holes_of(model, &faces);
-                let problems: Vec<String> = found.iter().filter_map(hole_problem).collect();
-                let holes: Vec<Hole> = found.into_iter().filter(|h| hole_problem(h).is_none()).collect();
-                let why = if !c.hole {
-                    Some("Only holes can be thread milled (this is the outside of a boss)".to_string())
-                } else if !c.vertical() {
-                    Some("The hole's axis is not vertical - lay the model flat first".to_string())
-                } else if holes.is_empty() {
-                    Some(problems.first().cloned().unwrap_or_else(|| "No vertical holes selected".into()))
-                } else {
-                    None
-                };
-                let skipped = faces.iter().filter(|f| !holes.iter().any(|h| h.faces.contains(f))).count();
+                let HolePick { holes, why, skipped } = pick_holes(model, *fi, sel_faces);
                 if ui
                     .add_enabled(why.is_none() && !holes.is_empty(), egui::Button::new(format!("Add to thread milling ({} hole{})", holes.len(), if holes.len() == 1 { "" } else { "s" })))
                     .on_hover_text("Bore and thread mill these holes. Ctrl+click holes to select several; holes of different size, top or depth go into separate items")
@@ -1740,13 +1827,9 @@ fn context_menu(
                 .on_disabled_hover_text(if !closed { "Needs a closed loop of edges" } else { "Edges must be level (constant Z)" })
                 .clicked()
             {
-                let (outer, z) = outline.clone().unwrap();
-                let (bottom, start) = edge_depths(model, &chain, z);
-                let start = from_top(start);
-                ops.push(StepOp {
-                    enabled: true,
-                    kind: OpKind::Pocket(PocketOp { face_id: usize::MAX, z: bottom, start_z: start, outer, edges: chain.clone(), edge_z: z, ..Default::default() }),
-                });
+                if let Ok(p) = edge_pocket(model, *edge, stock_top) {
+                    ops.push(StepOp { enabled: true, kind: OpKind::Pocket(p) });
+                }
                 ui.close_menu();
             }
             if ui
@@ -1755,26 +1838,13 @@ fn context_menu(
                 .on_disabled_hover_text("Edges must be level (constant Z)")
                 .clicked()
             {
-                let (path, z) = outline.unwrap();
-                let (bottom, start) = edge_depths(model, &chain, z);
-                let start = from_top(start);
-                ops.push(StepOp {
-                    enabled: true,
-                    kind: OpKind::Profile(ProfileOp {
-                        path,
-                        closed,
-                        edge_z: z,
-                        side: if closed { ProfileSide::Outside } else { ProfileSide::Center },
-                        z: bottom,
-                        start_z: start,
-                        edges: chain.clone(),
-                        ..Default::default()
-                    }),
-                });
+                if let Ok(p) = edge_profile(model, *edge, stock_top) {
+                    ops.push(StepOp { enabled: true, kind: OpKind::Profile(p) });
+                }
                 ui.close_menu();
             }
             if ui.button("Add mill tab").on_hover_text("Rectangular tab extruded up from the edge at the clicked point; the cutter lifts over it").clicked() {
-                ops.push(StepOp { enabled: true, kind: OpKind::Tab(MillTab { center: *point, angle: *angle, edges: chain, ..Default::default() }) });
+                ops.push(StepOp { enabled: true, kind: OpKind::Tab(mill_tab(model, *edge, *point, *angle)) });
                 ui.close_menu();
             }
         }

@@ -4,6 +4,8 @@ Generates G-code to helically bore holes and then thread-mill them (M2–M6).
 
     cargo run --release
 
+**CadQuery scripting:** [python/stepcam.py](python/stepcam.py) builds step milling jobs from a CadQuery script. It covers every Step Milling operation, and tabs and faces are picked with CadQuery selectors (see *Scripting from CadQuery* in the guide, and [python/example.py](python/example.py)).
+
 The user guide is [docs/user-guide.md](docs/user-guide.md). It is also built into the app: click **❓ Help** (top right) or press **F1** to open it at the section for the current tab, with a contents list and search.
 
 - **Thread Milling** tab: the *Thread Locations* table. Each group has a list of x,y locations,

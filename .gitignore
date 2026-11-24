@@ -18,6 +18,9 @@
 /*.STEP
 /*.STP
 
+# Output of python/example.py when run from the repository root
+/out/
+
 # Patch leftovers
 *.orig
 *.rej
