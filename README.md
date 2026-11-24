@@ -4,6 +4,8 @@ Generates G-code to helically bore holes and then thread-mill them (M2–M6).
 
     cargo run --release
 
+The user guide is [docs/user-guide.md](docs/user-guide.md). It is also built into the app: click **❓ Help** (top right) or press **F1** to open it at the section for the current tab, with a contents list and search.
+
 - **Thread Milling** tab: the *Thread Locations* table. Each group has a list of x,y locations,
   a thread size, a thread length (0–100 mm) and a hole-milling cutter.
 - **Tools & Settings** tab: Z heights, feeds/speeds, and the editable tool tables (end mills and the thread mill for each size). **Save settings… / Load settings…** store all of it as a JSON file.
@@ -19,13 +21,15 @@ Generates G-code to helically bore holes and then thread-mill them (M2–M6).
 - **Import STEP…** loads a part (B-rep faces built from lines, circles, ellipses and B-splines; loose
   wire edges too). Flat faces are shaded; cylindrical, conical, spherical, toroidal, B-spline and linear-extrusion faces are meshed and shaded too (other surface types show as edges only). Inch files are scaled to mm.
 - **Click** highlights a surface or an edge loop/chain; **Esc** clears it. **Right-click** opens the menu:
-  - flat surface facing +Z → **Face** (mill the whole part down to it, with overlap past the part) or
+  - flat surface facing +Z → **Face** (clear everything above it inside the part's outside profile offset outwards by half the tool diameter) or
     **Pocket** (clear inside its outer boundary; inner loops ignored unless "keep islands" is ticked)
     or **Engrave text** (the tool centre follows the letter outlines, *depth* into the surface, in
     *depth per pass* steps). Options: text (several lines allowed), capital height, font (built-in
     Sans / Mono or **Browse…** for any .ttf / .otf), tool (an engraving bit or an end mill; the
     groove width at full depth is shown), left / center / right and top / center /
-    bottom alignment, and X / Y of the anchor point from the centre of the surface.
+    bottom alignment, X / Y of the anchor point from the centre of the surface (default: where you
+    right-clicked) and the text angle about the anchor (default: reading left to right in the
+    current view, to the nearest 90°).
   - sloped flat surface (tilted but still facing upwards) → **Pocket**: cut down in depth-per-pass
     levels; at each level the area where the surface is below that level is cleared and its walls are
     cut to size (finish pass), leaving the slope as steps. Vertical and downward-facing surfaces have
@@ -53,6 +57,33 @@ Generates G-code to helically bore holes and then thread-mill them (M2–M6).
   helix, zigzag or plunge. Roughing leaves the *finish pass* amount on the walls, then a climb-milled
   finishing pass cuts them to size at each depth.
 - `testdata/pocket_block.step` is a sample part (made by `testdata/make_step.py`).
+
+## Simulator tab
+
+Plays a program against the stock and shows the material being cut away.
+
+- **Simulate:** the step milling program, the thread milling program, or any G-code file (**Open G-code…**; tools are looked up in the tool tables).
+- **Stock** is the step milling stock, or a box round the cutting moves (thread milling stock top = the groups' start Z). Tick **Custom stock** to type the box in.
+- The stock is a height map with up to 150 / 300 / 500 / 800 cells along its longer side (**Detail**). Each move sweeps the real tool shape through it:
+  - end mills and thread mills as flat cylinders;
+  - engraving bits as cones with their tip flat.
+
+  Arcs are followed to within 0.002 mm.
+- **Playback:**
+  - ⏮ ⏪ ▶/⏸ ⏩ ⏭ (Home, ←, Space, →, End): start, previous move, play/pause, next move, end.
+  - The time slider scrubs, and **Speed** runs from 0.1× to 2000× machine time. Machine time comes from the run-time estimate, so the clock matches it.
+  - Jumping back restores a saved snapshot instead of re-cutting from the start.
+- **3D view:** shaded stock (uncut stock tan, cut surfaces bright, cut-through floor dark), the tool with its flutes and shank, and the path. **Path: All** shows what is still to come faintly, **Done** shows only the path cut so far.
+- **G-code panel:** follows playback (**Follow**). Clicking a line runs the simulation to the end of that line's move.
+- **Machine panel:** time, line, tool, rapid / feed, X Y Z and material removed.
+- **Compare with model** (step milling):
+  - Colours the cut against the model's top surface: green within ±tolerance (default 0.02 mm), yellow to orange for stock left, red for gouges.
+  - Gives the share of the part at size, the most stock left and any gouge depth.
+- **Warnings**, listed as the simulation reaches them (click one to go there):
+  - rapid (G0) moves through material;
+  - cuts deeper than the tool's flute length. This includes walls beside the tool that stand higher than the flutes.
+  - unknown tool numbers;
+  - G20 / G91 (inch or incremental programs are not simulated).
 
 ## G-code ↔ 3D view
 
@@ -112,7 +143,7 @@ Toggling Offset converts the values so the stock itself does not change. The
 resulting size and stock top Z are shown next to the inputs, with a warning if
 the stock is smaller than the part.
 
-Facing covers the whole stock (plus the overlap). New operations that cut from
+Facing clears everything above its surface inside the part's outside profile, offset outwards by half the tool diameter (plus *Extra past outline*). New operations that cut from
 the top of the part start at the stock top, and operations whose Start Z is at
 the stock top follow it when the stock changes.
 
@@ -130,16 +161,17 @@ Thread Milling tab only applies to thread milling.
 works layer by layer from the stock top (Start Z) down to the part bottom
 (Bottom Z):
 
-* Inside the part outline (seen from above) all material is cleared:
-  pockets, holes and open steps such as the area above a flange. Open edges
-  are cut right through, so no fin is left at the outline.
-* If the stock is taller than the part, roughing first faces the whole
-  stock top (with overlap past its edges, climb milled, in layer-height
-  steps) down to the part top + stock to leave; the layers below carry on
-  from there.
-* Outside the part nothing else is cleared: the outside outline of the material
-  at that height is profiled once per layer (CW, climb), ramping down along
-  the contour.
+* Every layer clears everything down to that height except the part, inside
+  the part's outside profile (seen from above) offset outwards by half the
+  tool diameter: pockets, holes, open steps such as the area above a flange,
+  and a band round the part just wide enough for the cutter to run round its
+  outer walls. Stock further out (e.g. the corners of a square block around a
+  round part) is left. The part's walls are the clearing's islands, climb
+  milled at each layer.
+* If the stock is taller than the part, roughing first faces it down to the
+  part top + stock to leave (climb milled, in layer-height steps) over the
+  same band - the outside profile offset outwards by half the tool diameter;
+  the layers below carry on from there.
 * Sloped and curved surfaces are followed: at each layer only the part of
   the surface above the layer (plus stock to leave) is kept, so slopes,
   domes, fillets and chamfers are roughed down in steps and the outside

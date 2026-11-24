@@ -42,11 +42,13 @@ pub struct ViewOut {
     pub left_pick: Option<Option<Pick>>,
     /// Set when the user right-clicked.
     pub right_pick: Option<Option<Pick>>,
+    /// Model point under the cursor at the right-click (faces and edges).
+    pub right_point: Option<[f64; 3]>,
 }
 
 pub struct View3d {
-    yaw: f32,
-    pitch: f32,
+    pub(crate) yaw: f32,
+    pub(crate) pitch: f32,
     scale: f32,
     target: [f32; 3],
     pub show_rapid: bool,
@@ -112,7 +114,7 @@ impl View3d {
     }
 
     /// Rotate a world-space direction into view space (x right, y depth away from viewer, z up).
-    fn rot(&self, d: [f32; 3]) -> [f32; 3] {
+    pub(crate) fn rot(&self, d: [f32; 3]) -> [f32; 3] {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
         let x1 = d[0] * cy - d[1] * sy;
@@ -121,7 +123,7 @@ impl View3d {
     }
 
     /// World point -> view space, relative to the target.
-    fn to_view(&self, p: [f32; 3]) -> [f32; 3] {
+    pub(crate) fn to_view(&self, p: [f32; 3]) -> [f32; 3] {
         self.rot([p[0] - self.target[0], p[1] - self.target[1], p[2] - self.target[2]])
     }
 
@@ -134,7 +136,7 @@ impl View3d {
         [v[0] * cy + y1 * sy, -v[0] * sy + y1 * cy, z1]
     }
 
-    fn project(&self, rect: Rect, p: [f32; 3]) -> Pos2 {
+    pub(crate) fn project(&self, rect: Rect, p: [f32; 3]) -> Pos2 {
         let v = self.to_view(p);
         rect.center() + Vec2::new(v[0] * self.scale, -v[2] * self.scale)
     }
@@ -155,6 +157,19 @@ impl View3d {
     }
 
     fn pick(&self, rect: Rect, m: &Model, pos: Pos2) -> Option<Pick> {
+        self.pick_at(rect, m, pos).0
+    }
+
+    /// Text direction (degrees, CCW from +X) that reads left to right in the
+    /// current view, rounded to the nearest 90 degrees.
+    pub fn reading_angle(&self) -> f64 {
+        // screen right in world space is (cos yaw, -sin yaw, 0)
+        let a = (-self.yaw as f64).to_degrees();
+        ((a / 90.0).round() * 90.0).rem_euclid(360.0)
+    }
+
+    /// What is under the cursor, and the 3D point there.
+    fn pick_at(&self, rect: Rect, m: &Model, pos: Pos2) -> (Option<Pick>, Option<[f64; 3]>) {
         // edges within 6 px win over faces
         let mut best: Option<(f32, usize, [f64; 3], f64)> = None;
         for (ei, e) in m.edges.iter().enumerate() {
@@ -170,10 +185,10 @@ impl View3d {
             }
         }
         if let Some((_, edge, point, angle)) = best {
-            return Some(Pick::Edge { edge, point, angle });
+            return (Some(Pick::Edge { edge, point, angle }), Some(point));
         }
         // nearest face triangle under the cursor
-        let mut best_face: Option<(f32, usize)> = None;
+        let mut best_face: Option<(f32, usize, [f64; 3])> = None;
         for (fi, f) in m.faces.iter().enumerate() {
             for t in &f.tris {
                 let p: Vec<Pos2> = t.iter().map(|&q| self.project(rect, f3(q))).collect();
@@ -187,12 +202,133 @@ impl View3d {
                 if l0 >= 0.0 && l1 >= 0.0 && l2 >= 0.0 {
                     let depth = l0 * self.to_view(f3(t[0]))[1] + l1 * self.to_view(f3(t[1]))[1] + l2 * self.to_view(f3(t[2]))[1];
                     if best_face.map_or(true, |b| depth < b.0) {
-                        best_face = Some((depth, fi));
+                        let (a, b, c) = (l0 as f64, l1 as f64, l2 as f64);
+                        let pt = [0, 1, 2].map(|k| t[0][k] * a + t[1][k] * b + t[2][k] * c);
+                        best_face = Some((depth, fi, pt));
                     }
                 }
             }
         }
-        best_face.map(|(_, f)| Pick::Face(f))
+        (best_face.map(|(_, f, _)| Pick::Face(f)), best_face.map(|(_, _, p)| p))
+    }
+
+    /// Iso / Top / Front / Side / Fit buttons.
+    pub fn view_buttons(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Iso").clicked() {
+            self.iso();
+            self.needs_fit = true;
+        }
+        if ui.button("Top").clicked() {
+            self.yaw = 0.0;
+            self.pitch = FRAC_PI_2;
+            self.needs_fit = true;
+        }
+        if ui.button("Front").clicked() {
+            self.yaw = 0.0;
+            self.pitch = 0.0;
+            self.needs_fit = true;
+        }
+        if ui.button("Side").clicked() {
+            self.yaw = -FRAC_PI_2;
+            self.pitch = 0.0;
+            self.needs_fit = true;
+        }
+        if ui.button("Fit").clicked() {
+            self.needs_fit = true;
+        }
+    }
+
+    /// World direction pointing away from the viewer.
+    pub(crate) fn view_dir(&self) -> [f32; 3] {
+        self.view_vec_to_world([0.0, 1.0, 0.0])
+    }
+
+    /// Orbit / pan / zoom / double-click fit.
+    fn interact(&mut self, ui: &egui::Ui, rect: Rect, resp: &egui::Response) {
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            let d = resp.drag_delta();
+            self.yaw += d.x * 0.01;
+            self.pitch = (self.pitch + d.y * 0.01).clamp(-FRAC_PI_2, FRAC_PI_2);
+        }
+        if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
+            let d = resp.drag_delta();
+            let w = self.view_vec_to_world([d.x / self.scale, 0.0, -d.y / self.scale]);
+            for k in 0..3 {
+                self.target[k] -= w[k];
+            }
+        }
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                let old = self.scale;
+                let new = (old * (scroll * 0.003).exp()).clamp(0.01, 1e5);
+                if let Some(m) = resp.hover_pos() {
+                    // keep the point under the cursor fixed
+                    let d = m - rect.center();
+                    let dv = [d.x / new - d.x / old, 0.0, -d.y / new + d.y / old];
+                    let w = self.view_vec_to_world(dv);
+                    for k in 0..3 {
+                        self.target[k] -= w[k];
+                    }
+                }
+                self.scale = new;
+            }
+        }
+        if resp.double_clicked() {
+            self.needs_fit = true;
+        }
+    }
+
+    /// A bare 3D scene: camera controls, ground grid at `grid_z` and the axis
+    /// triad, with `draw` painting the contents. `min`/`max` bound the scene for fitting.
+    pub fn scene(&mut self, ui: &mut egui::Ui, min: [f32; 3], max: [f32; 3], grid_z: f32, draw: impl FnOnce(&View3d, &egui::Painter, Rect)) -> egui::Response {
+        let (rect, resp) = ui.allocate_exact_size(ui.available_size().max(Vec2::splat(50.0)), Sense::click_and_drag());
+        self.interact(ui, rect, &resp);
+        if self.needs_fit {
+            self.fit(rect, min, max);
+            self.needs_fit = false;
+        }
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+        self.draw_grid(ui, &painter, rect, min, max, grid_z);
+        draw(self, &painter, rect);
+        self.draw_triad(&painter, rect);
+        resp
+    }
+
+    fn draw_grid(&self, ui: &egui::Ui, painter: &egui::Painter, rect: Rect, min: [f32; 3], max: [f32; 3], grid_z: f32) {
+        let span = (max[0] - min[0]).max(max[1] - min[1]).max(1.0);
+        let step = nice_step(span / 8.0);
+        let gx0 = (min[0] / step).floor() * step - step;
+        let gx1 = (max[0] / step).ceil() * step + step;
+        let gy0 = (min[1] / step).floor() * step - step;
+        let gy1 = (max[1] / step).ceil() * step + step;
+        let grid_stroke = Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.6));
+        let mut x = gx0;
+        while x <= gx1 + 1e-3 {
+            painter.line_segment([self.project(rect, [x, gy0, grid_z]), self.project(rect, [x, gy1, grid_z])], grid_stroke);
+            x += step;
+        }
+        let mut y = gy0;
+        while y <= gy1 + 1e-3 {
+            painter.line_segment([self.project(rect, [gx0, y, grid_z]), self.project(rect, [gx1, y, grid_z])], grid_stroke);
+            y += step;
+        }
+    }
+
+    fn draw_triad(&self, painter: &egui::Painter, rect: Rect) {
+        // axis triad in the corner (directions only)
+        let origin = rect.left_bottom() + Vec2::new(36.0, -36.0);
+        for (axis, color, label) in [
+            ([1.0, 0.0, 0.0], Color32::from_rgb(230, 70, 70), "X"),
+            ([0.0, 1.0, 0.0], Color32::from_rgb(80, 200, 90), "Y"),
+            ([0.0, 0.0, 1.0], Color32::from_rgb(80, 130, 255), "Z"),
+        ] {
+            let v = self.rot(axis);
+            let tip = origin + Vec2::new(v[0], -v[2]) * 24.0;
+            painter.line_segment([origin, tip], Stroke::new(2.0_f32, color));
+            painter.text(tip, egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), color);
+        }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, tp: &Toolpath, holes: &[HoleViz], model: Option<&ModelViz>) -> ViewOut {
@@ -236,67 +372,14 @@ impl View3d {
                 ui.checkbox(&mut self.show_holes, "Holes");
             }
             ui.separator();
-            if ui.button("Iso").clicked() {
-                self.iso();
-                self.needs_fit = true;
-            }
-            if ui.button("Top").clicked() {
-                self.yaw = 0.0;
-                self.pitch = FRAC_PI_2;
-                self.needs_fit = true;
-            }
-            if ui.button("Front").clicked() {
-                self.yaw = 0.0;
-                self.pitch = 0.0;
-                self.needs_fit = true;
-            }
-            if ui.button("Side").clicked() {
-                self.yaw = -FRAC_PI_2;
-                self.pitch = 0.0;
-                self.needs_fit = true;
-            }
-            if ui.button("Fit").clicked() {
-                self.needs_fit = true;
-            }
+            self.view_buttons(ui);
             ui.separator();
             ui.weak("drag: orbit · right/middle drag: pan · scroll: zoom · double-click: fit");
         });
 
         let (rect, resp) = ui.allocate_exact_size(ui.available_size().max(Vec2::splat(50.0)), Sense::click_and_drag());
 
-        // --- interaction
-        if resp.dragged_by(egui::PointerButton::Primary) {
-            let d = resp.drag_delta();
-            self.yaw += d.x * 0.01;
-            self.pitch = (self.pitch + d.y * 0.01).clamp(-FRAC_PI_2, FRAC_PI_2);
-        }
-        if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
-            let d = resp.drag_delta();
-            let w = self.view_vec_to_world([d.x / self.scale, 0.0, -d.y / self.scale]);
-            for k in 0..3 {
-                self.target[k] -= w[k];
-            }
-        }
-        if resp.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                let old = self.scale;
-                let new = (old * (scroll * 0.003).exp()).clamp(0.01, 1e5);
-                if let Some(m) = resp.hover_pos() {
-                    // keep the point under the cursor fixed
-                    let d = m - rect.center();
-                    let dv = [d.x / new - d.x / old, 0.0, -d.y / new + d.y / old];
-                    let w = self.view_vec_to_world(dv);
-                    for k in 0..3 {
-                        self.target[k] -= w[k];
-                    }
-                }
-                self.scale = new;
-            }
-        }
-        if resp.double_clicked() {
-            self.needs_fit = true;
-        }
+        self.interact(ui, rect, &resp);
         if self.needs_fit && has_bounds {
             self.fit(rect, min, max);
             self.needs_fit = false;
@@ -304,13 +387,16 @@ impl View3d {
 
         let mut left_pick = None;
         let mut right_pick = None;
+        let mut right_point = None;
         if let (Some(mv), true) = (model, self.show_model) {
             if let Some(pos) = resp.interact_pointer_pos() {
                 if resp.clicked() && !resp.double_clicked() {
                     left_pick = Some(self.pick(rect, mv.model, pos));
                 }
                 if resp.secondary_clicked() {
-                    right_pick = Some(self.pick(rect, mv.model, pos));
+                    let (p, pt) = self.pick_at(rect, mv.model, pos);
+                    right_pick = Some(p);
+                    right_point = pt;
                 }
             }
         }
@@ -327,7 +413,7 @@ impl View3d {
                 egui::FontId::proportional(14.0),
                 ui.visuals().weak_text_color(),
             );
-            return ViewOut { response: resp, left_pick, right_pick };
+            return ViewOut { response: resp, left_pick, right_pick, right_point };
         }
 
         // ground grid on the XY plane
@@ -342,23 +428,7 @@ impl View3d {
                 }
             }
         };
-        let span = (max[0] - min[0]).max(max[1] - min[1]).max(1.0);
-        let step = nice_step(span / 8.0);
-        let gx0 = (min[0] / step).floor() * step - step;
-        let gx1 = (max[0] / step).ceil() * step + step;
-        let gy0 = (min[1] / step).floor() * step - step;
-        let gy1 = (max[1] / step).ceil() * step + step;
-        let grid_stroke = Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.6));
-        let mut x = gx0;
-        while x <= gx1 + 1e-3 {
-            painter.line_segment([self.project(rect, [x, gy0, grid_z]), self.project(rect, [x, gy1, grid_z])], grid_stroke);
-            x += step;
-        }
-        let mut y = gy0;
-        while y <= gy1 + 1e-3 {
-            painter.line_segment([self.project(rect, [gx0, y, grid_z]), self.project(rect, [gx1, y, grid_z])], grid_stroke);
-            y += step;
-        }
+        self.draw_grid(ui, &painter, rect, min, max, grid_z);
 
         if let (Some(mv), true) = (model, self.show_model) {
             self.draw_model(ui, &painter, rect, mv);
@@ -415,18 +485,7 @@ impl View3d {
             painter.circle_filled(b, 4.5, HIGHLIGHT);
         }
 
-        // axis triad in the corner (directions only)
-        let origin = rect.left_bottom() + Vec2::new(36.0, -36.0);
-        for (axis, color, label) in [
-            ([1.0, 0.0, 0.0], Color32::from_rgb(230, 70, 70), "X"),
-            ([0.0, 1.0, 0.0], Color32::from_rgb(80, 200, 90), "Y"),
-            ([0.0, 0.0, 1.0], Color32::from_rgb(80, 130, 255), "Z"),
-        ] {
-            let v = self.rot(axis);
-            let tip = origin + Vec2::new(v[0], -v[2]) * 24.0;
-            painter.line_segment([origin, tip], Stroke::new(2.0_f32, color));
-            painter.text(tip, egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), color);
-        }
+        self.draw_triad(&painter, rect);
 
         let info = if tp.is_empty() {
             format!("X {:.2} … {:.2}\nY {:.2} … {:.2}\nZ {:.2} … {:.2}", min[0], max[0], min[1], max[1], min[2], max[2])
@@ -438,7 +497,7 @@ impl View3d {
         };
         painter.text(rect.right_top() + Vec2::new(-8.0, 8.0), egui::Align2::RIGHT_TOP, info, egui::FontId::monospace(11.0), ui.visuals().weak_text_color());
 
-        ViewOut { response: resp, left_pick, right_pick }
+        ViewOut { response: resp, left_pick, right_pick, right_point }
     }
 
     fn draw_model(&self, ui: &egui::Ui, painter: &egui::Painter, rect: Rect, mv: &ModelViz) {
@@ -548,4 +607,26 @@ fn nice_step(raw: f32) -> f32 {
         10.0
     };
     m * mag
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reading_angle_snaps_to_the_view() {
+        let mut v = View3d::default();
+        assert_eq!(v.reading_angle(), 0.0); // default iso view (yaw -30 degrees)
+        for (yaw_deg, want) in [(0.0, 0.0), (-90.0, 90.0), (90.0, 270.0), (180.0, 180.0), (-200.0, 180.0), (44.0, 0.0), (46.0, 270.0)] {
+            v.yaw = (yaw_deg as f32).to_radians();
+            assert_eq!(v.reading_angle(), want, "yaw {yaw_deg}");
+        }
+        // the chosen direction is the one most nearly along screen-right
+        for yaw_deg in [-170.0f32, -100.0, -10.0, 30.0, 120.0] {
+            v.yaw = yaw_deg.to_radians();
+            let a = (v.reading_angle() as f32).to_radians();
+            let on_screen = v.rot([a.cos(), a.sin(), 0.0]);
+            assert!(on_screen[0] > 0.7, "yaw {yaw_deg}: {on_screen:?}");
+        }
+    }
 }

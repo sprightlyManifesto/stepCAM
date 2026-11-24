@@ -19,11 +19,23 @@ struct Seg {
     vmax: f64,
     /// Must stop before this segment (tool change).
     stop_before: bool,
+    /// 0-based source line the segment comes from.
+    line: usize,
 }
 
 /// Estimated run time in seconds. `rapid` and feeds in mm/min, `accel` in mm/s².
 pub fn estimate(code: &str, rapid: f64, accel: f64) -> f64 {
-    plan_time(&segments(code, rapid), accel.max(1e-3))
+    plan_times(&segments(code, rapid), accel.max(1e-3)).iter().sum()
+}
+
+/// Estimated time of each source line (s), indexed by 0-based line number.
+pub fn line_times(code: &str, rapid: f64, accel: f64) -> Vec<f64> {
+    let segs = segments(code, rapid);
+    let mut out = vec![0.0; code.lines().count()];
+    for (s, t) in segs.iter().zip(plan_times(&segs, accel.max(1e-3))) {
+        out[s.line] += t;
+    }
+    out
 }
 
 /// The program as straight segments with their speed limits.
@@ -35,7 +47,7 @@ fn segments(code: &str, rapid: f64) -> Vec<Seg> {
     let mut feed = 0.0f64; // mm/s
     let mut stop = false;
 
-    for raw in code.lines() {
+    for (ln, raw) in code.lines().enumerate() {
         let mut line = String::with_capacity(raw.len());
         let mut depth = 0;
         for c in raw.chars() {
@@ -113,7 +125,7 @@ fn segments(code: &str, rapid: f64) -> Vec<Seg> {
                 let d = [p[0] - prev[0], p[1] - prev[1], p[2] - prev[2]];
                 let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
                 if len > 1e-9 {
-                    segs.push(Seg { len, dir: [d[0] / len, d[1] / len, d[2] / len], vmax: vmax.max(1e-6), stop_before: stop });
+                    segs.push(Seg { len, dir: [d[0] / len, d[1] / len, d[2] / len], vmax: vmax.max(1e-6), stop_before: stop, line: ln });
                     stop = false;
                 }
                 prev = p;
@@ -124,11 +136,11 @@ fn segments(code: &str, rapid: f64) -> Vec<Seg> {
     segs
 }
 
-/// Time to run the segments with entry speeds planned forwards and backwards.
-fn plan_time(segs: &[Seg], a: f64) -> f64 {
+/// Time of each segment with entry speeds planned forwards and backwards.
+fn plan_times(segs: &[Seg], a: f64) -> Vec<f64> {
     let n = segs.len();
     if n == 0 {
-        return 0.0;
+        return vec![];
     }
     // max entry speed of each segment from the corner with the one before
     let mut vin = vec![0.0f64; n + 1]; // vin[n] = speed at the end = 0
@@ -159,7 +171,7 @@ fn plan_time(segs: &[Seg], a: f64) -> f64 {
     for k in 0..n {
         vin[k + 1] = vin[k + 1].min((vin[k] * vin[k] + 2.0 * a * segs[k].len).sqrt());
     }
-    segs.iter().enumerate().map(|(k, s)| seg_time(s.len, vin[k], vin[k + 1], s.vmax, a)).sum()
+    segs.iter().enumerate().map(|(k, s)| seg_time(s.len, vin[k], vin[k + 1], s.vmax, a)).collect()
 }
 
 /// Trapezoid (or triangle) time over `len` from speed v0 to v1, cruising at vm.
@@ -252,5 +264,14 @@ mod tests {
         assert_eq!(format_time(3725.0), "1 h 02 min");
         assert_eq!(format_time(725.4), "12 min 05 s");
         assert_eq!(format_time(45.0), "45 s");
+    }
+
+    #[test]
+    fn line_times_add_up_to_the_estimate() {
+        let code = "G0 X0 Y0 Z0\nG1 X50 F3000\n(note)\nG1 Y50\nG3 X0 Y50 I-25 J0\n";
+        let lt = line_times(code, 6000.0, 200.0);
+        assert_eq!(lt.len(), 5);
+        assert!(lt[0] == 0.0 && lt[2] == 0.0 && lt[1] > 0.0 && lt[4] > lt[1]);
+        assert!((lt.iter().sum::<f64>() - estimate(code, 6000.0, 200.0)).abs() < 1e-9);
     }
 }

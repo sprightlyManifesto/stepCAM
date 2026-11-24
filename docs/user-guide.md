@@ -1,0 +1,390 @@
+# stepCAM User Guide
+
+stepCAM turns a part into G-code for a 3-axis CNC mill. It does two jobs:
+
+- **Thread milling:** bores holes with a helix and thread-mills them (M2 to M6), from a list of X, Y locations.
+- **Step milling:** imports a STEP model and machines it from above with facing, pocketing, profiling, roughing, engraving and thread milling.
+
+The **Simulator** tab plays either program against a block of stock, so you can check it before it goes near the machine.
+
+All units are millimetres. Programs are climb milled throughout, for a spindle turning clockwise (M3).
+
+## Getting started
+
+A typical step milling session:
+
+1. On **Tools & Settings**, check that the tool table matches the tools in your machine. The tool numbers must match the machine's tool table.
+2. On **Step Milling**, click **📂 Import STEP…** and open your part.
+3. Place the part. Right-click its bottom face and choose **Lay flat on this surface**, or use **Set Z…** to put a surface at a chosen height.
+4. Set the **Stock** size, for example 2 mm extra on every side.
+5. Add operations. **➕ Rough** is usually first. Then right-click surfaces and edges to add facing, pockets, profiles, engraving and thread milling.
+6. Open **Simulator**, press ⏭ and check the result. Look for red gouges and for warnings.
+7. Type a file name next to **G-code file:** and click **💾 Save G-code**.
+8. Click **Save** next to **Job file:** to keep the whole job for later.
+
+The G-code updates by itself whenever you change something, so there is no Generate button.
+
+## The window
+
+- **Tabs** along the top: **Thread Milling**, **Step Milling**, **Simulator** and **Tools & Settings**. There is also a **❓ Help** button, which opens this guide (F1 does the same).
+- **File bar** under the tabs:
+  - **Job file:** with **Load** and **Save**.
+  - **G-code file:** with **💾 Save G-code**.
+  - The G-code line count and the **Estimated run time**.
+  - Errors that stop the program being generated, and status messages.
+- **G-code panel** on the right: the program for the current tab.
+  - **📋 Copy** puts the whole program on the clipboard.
+  - Click a line, or move through the lines with the arrow keys, to highlight its move in the 3D view.
+- **3D view:** see the next section.
+
+### Moving around the 3D view
+
+- **Left-drag:** orbit.
+- **Right-drag or middle-drag:** pan.
+- **Scroll:** zoom in or out at the cursor.
+- **Double-click:** fit everything in view.
+- **Iso / Top / Front / Side / Fit** buttons: standard views.
+- The small X / Y / Z arrows in the corner show which way the axes point.
+
+### Toolpath colours
+
+- **Red, faint:** rapid moves (G0).
+- **Blue:** hole milling (thread milling tab) or milling (step milling).
+- **Orange:** threading.
+- **Cyan:** the move of the G-code line you clicked. A hollow dot marks where it starts, a filled dot where it ends.
+
+The checkboxes above the view switch each kind on or off. **Esc** clears the selection and the highlight.
+
+## Jobs and files
+
+- **Job file** (`.stepcam.json`): the whole job, which includes:
+  - thread groups;
+  - step milling operations;
+  - stock;
+  - model placement;
+  - machining settings and tool tables;
+  - the path of the STEP file.
+
+  **Load** opens the job and re-imports the STEP model from that path. Keep the STEP file where it was, or re-import it.
+- **G-code file:** the program for the current tab. On the Simulator tab it is the program being simulated. Saving is refused while the program has errors.
+- **Settings file:** **💾 Save settings… / 📂 Load settings…** on the Tools & Settings tab store only the machining settings and tool tables. Use this to share one tool table between jobs.
+
+Typed paths are relative to the folder stepCAM was started from.
+
+## Thread Milling tab
+
+This tab makes a program that bores and threads holes at X, Y locations you type in. No model is needed.
+
+### Settings at the top
+
+- **Spindle speed:** for boring and threading.
+- **Rapid plane Z:** absolute Z for rapids between groups and for tool changes.
+- **Milling feed:** helical boring feed at the cutter centre.
+- **Threading feed:** at the cutting edge. The feed at the tool centre is reduced automatically.
+- **Milling down angle:** the default helix descent angle for new groups. **Apply to all groups** copies it to every group.
+
+### Thread groups
+
+Each row of the **Thread Locations** table is a group of identical holes:
+
+- **Thread:** M2, M2.5, M3, M4, M5 or M6.
+- **Hole start Z:** the top of the material at the holes. All hole geometry is below it.
+- **Thread length:** how deep the thread goes, from 0 to 100 mm.
+- **Descent angle:** the helix angle while boring.
+- **Milling cutter:** the end mill that bores the hole. Only cutters smaller than the tap-drill hole can be chosen.
+- **Locations:** one per line, as `x, y` or `X10 Y20`.
+
+The row shows the hole Ø, its depth and bottom Z, the pitch and the number of holes, with **✔ OK** or a list of problems. The buttons ⬆ ⬇ ⧉ 🗑 move, duplicate or remove the group. **➕ Add group** adds a new one.
+
+### How the holes are cut
+
+- **Hole depth:** the thread length plus one pitch.
+- **Boring:** the hole is bored to the tap-drill Ø with a helix, in rings set by **Boring ring stepover** on Tools & Settings.
+- **Threading:** the thread mill goes to the bottom of the thread and climbs out with G3, so the thread stops one pitch above the bottom of the hole.
+- **Order:** all holes are bored first, then all are threaded, so there are as few tool changes as possible. Boring visits the holes nearest-next, and threading runs the same route backwards, starting where boring ended.
+
+## Step Milling tab
+
+### Importing a model
+
+**📂 Import STEP…** reads `.step` / `.stp` files:
+
+- **Surfaces:** flat, cylindrical, conical, spherical, toroidal, B-spline and extruded surfaces are shaded. Other surface types show as edges only.
+- **Wires:** loose wire edges in the file are shown in purple and can be used for profiles.
+- **Units:** inch files are converted to millimetres.
+
+The status bar shows how many faces and edges were read.
+
+### Selecting
+
+- **Click** a surface or an edge to highlight it. Clicking an edge selects the whole loop or chain it belongs to.
+- **Ctrl+click** (Cmd on macOS) cylindrical holes to select several. Ctrl+click a selected hole again to drop it.
+- **Right-click** opens the menu for whatever is under the cursor. The menu shows what the item is, for example *Flat surface at Z5* or *Cylinder Ø6 (hole)*, and the operations that suit it.
+- **Esc** clears the selection.
+
+### Placing the model
+
+Right-click a flat surface:
+
+- **Set Z…** (surfaces facing straight up or down only): type a Z and press **Apply** or Enter. The whole model moves up or down so that the surface sits at that Z.
+- **Lay flat on this surface:** turns the model so this surface faces down, as if the part were resting on the table on it. The part keeps its XY centre and its new top ends at Z0.
+- **Reset placement:** back to the coordinates in the STEP file.
+
+The placement is saved in the job, and the operations follow the model:
+
+- Depths, boundaries and Start Z move with their surfaces.
+- Tabs move and turn with the part.
+- An operation whose surface no longer faces up is switched off and listed in the status bar.
+
+### Stock
+
+Set the raw material with the **Stock X / Y / Z** inputs. It is drawn as an orange wire box.
+
+- **Offset** ticked (the default): the values are added to the part's bounding box. X and Y are split over both sides and Z goes on top. All zeros means the stock is exactly the part's box.
+- **Offset** unticked: the values are the absolute stock size. The stock is centred on the part in XY, with its bottom level with the part bottom.
+
+Switching Offset converts the numbers so the stock itself doesn't change. The resulting size and stock top are shown, with a warning if the stock is smaller than the part.
+
+New operations that cut from the top start at the stock top, and follow it when you change the stock.
+
+### Rapid plane
+
+**Rapid plane height above stock or part** (default 10 mm) is added to the highest point of the stock or the part, whichever is higher. The resulting Z is shown next to the input. All rapids between cuts and all tool changes happen there.
+
+### The operations list
+
+Operations run from the top of the list down.
+
+- **Checkbox:** include the operation in the program, or leave it out.
+- **Click** an operation to open its settings and highlight it in the 3D view.
+- **⬆ / ⬇:** reorder. **🗑:** remove.
+
+Every operation has a **Tool** (from the tool table), **Feed** (mm/min) and **Speed** (rpm). Cuts are climb milled, and the order within each operation keeps non-cutting moves short.
+
+## Step milling operations
+
+### Rough
+
+**➕ Rough** at the top of the operations list adds roughing. It clears the material layer by layer, from **Start Z** (the stock top) down to **Bottom Z** (the part bottom).
+
+- **Where it cuts:** each layer clears everything down to that height except the part. This covers pockets, holes, open steps such as the area above a flange, and a band round the part just wide enough for the cutter to run round its outside walls. The band is the part's outline seen from above, offset outwards by half the tool diameter. Stock further out, such as the corners of a square block round a round part, is left alone.
+- **Walls:** the part's walls are profiled at every layer.
+- **Stock facing:** if the stock is taller than the part, roughing first faces it down to the part top (plus stock to leave) over the same band. The row shows the Z range, or *none*.
+- **Slopes and curves:** sloped and curved surfaces (fillets, chamfers, domes) are followed. They are roughed down in steps, and the outline steps in and out with them.
+- **Layer height:** the spacing of the layers. Extra layers are added at every flat floor and at the top and foot of every sloped or curved surface, so each one is roughed to its depth.
+- **Stepover:** % of the cutter Ø between passes.
+- **Stock to leave:** left on all walls and floors for finishing operations. The default is 0.
+- **Clear voids** (default on): pockets, steps and counterbores are always cleared. When unticked, holes that go right through the part are only profiled round their wall, so the core can drop out.
+- **Overcut Z:** carries the last layer this far below Bottom Z, for example to cut the part free.
+- **Strategy:** **Standard** (concentric offset passes) or **Adaptive clearing** (trochoidal loops, with their own advance per loop).
+- **Entry:** **Helix**, **Zigzag** or **Plunge**. **Ramp angle** is the helix or zigzag angle.
+
+Roughing sees the part from above, so undercuts can't be reached. Hops between cuts stay low (0.5 mm above the layer above) when they only pass over ground already cleared. Otherwise they go up to the retract height.
+
+### Face
+
+Right-click a flat surface that faces up and choose **Face**. Facing mills everything above that surface flat, down to it, in **Depth per pass** steps. It only cuts inside the part's outside outline offset outwards by half the tool diameter, and not out to the whole stock.
+
+- **Extra past outline:** goes this much further out (default 0).
+- **Stepover:** % of the cutter Ø between rows.
+- **Start Z:** the top of the material, which follows the stock top.
+
+Rows run in +X (climb), stepping towards −Y. Where the outline splits a row in two, the tool only stays low between the pieces if it passes over ground already faced.
+
+### Pocket
+
+Right-click a flat surface that faces up and choose **Pocket**. The pocket clears the area inside the surface's outer boundary, down to the surface.
+
+- **Islands:** inner loops, such as bosses in the pocket, are ignored by default and the whole area is cleared. Tick **keep N inner loop(s)** to leave them standing.
+- **Strategy / Entry / Ramp angle / Stepover:** as for Rough.
+- **Finish pass:** the amount left on the walls by the clearing passes. A climb-milled finishing pass then cuts the walls to size at each depth.
+- **Depth per pass**, and **Start Z** (the top of the material).
+
+You can also make a pocket from a closed, level loop of edges (right-click an edge, then **Pocket**). Its **Pocket floor Z** can then be edited.
+
+**Sloped surfaces:** a flat surface that is tilted but still faces upwards can be pocketed too. Pocketing goes down in depth-per-pass levels. At each level it clears where the surface is below that level and cuts the walls to size, leaving the slope as steps. The row shows the Z range and the number of levels. Vertical surfaces, surfaces facing down and curved surfaces have no surface operations, but Rough follows them.
+
+### Profile
+
+Right-click an edge (which selects its loop or chain) and choose **Profile** to cut along it. **Tool position** sets where the tool runs:
+
+- **on centre line:** the tool centre follows the edges. This works on any chain, open or closed.
+- **inside / outside:** the tool is offset by its radius, so the edge of the cut lies on the edges. Closed loops only. Outside runs clockwise and inside runs anticlockwise, both climb.
+
+Each depth level ramps down along the path at the **Ramp angle**, then makes a full pass at depth. Open chains ramp back and forth.
+
+The default depths come from the model:
+
+- an edge on a rim (outline, pocket or hole top) cuts down to the bottom of the walls next to it;
+- an edge on a floor cuts from the top of its walls down to it;
+- a loose wire cuts 1 mm deep.
+
+Change **Start Z** / **Bottom Z** if you need different depths.
+
+### Engrave text
+
+Right-click a flat surface that faces up and choose **Engrave text**. The tool centre follows the outlines of the letters.
+
+- **Text:** one line of text per line.
+- **Height:** the height of the capital letters.
+- **Depth** below the surface, and **Depth per pass**.
+- **Font:** built-in **Sans** or **Mono**, or **Browse…** for any `.ttf` / `.otf` file.
+- **Tool:** an engraving bit or an end mill. **Line width** shows how wide the groove is at the surface. A tapered bit cuts wider the deeper it goes.
+- **Horizontal align / Vertical align:** where the text sits relative to the anchor point. **Top** puts the top of the capitals on the anchor, and **Bottom** puts the baseline of the last line on it.
+- **X / Y:** the anchor point, measured from the centre of the surface. It defaults to where you right-clicked.
+- **Angle:** the text direction, anticlockwise from +X, turned about the anchor. It defaults to reading left to right in the current view, rounded to the nearest 90°. Turn the view before right-clicking to get the text the right way up.
+
+Plunges run at half the feed.
+
+### Thread milling from the model
+
+Right-click a cylindrical hole and choose **Add to thread milling**. Ctrl+click several holes first to include them all. This adds a thread milling item with the same fields as a group on the Thread Milling tab, filled in from the model:
+
+- **Locations:** the hole centres. They are re-taken when the model moves.
+- **Hole start Z:** the top of the hole.
+- **Thread:** the closest match to the hole Ø, within 0.3 mm. A tap-drill match wins over a major-Ø match, so a Ø5 hole becomes M6.
+- **Thread length:**
+  - blind holes: the modelled depth minus one pitch, so the bored depth matches the model;
+  - through holes: the full depth.
+
+Holes with a different size, top or depth go into separate items.
+
+**Thread mill all alike holes** (same menu) does this for every hole in the model with the same Ø, depth and blind or through type. Holes that already have a thread milling item are skipped.
+
+Only full, vertical holes qualify. Bosses, slot ends, corner fillets and bores of other sizes don't.
+
+**Other operations leave thread-milled holes alone**, wherever the items are in the list. The thread's volume (its major Ø, from the hole top down to the hole bottom) counts as solid:
+
+- Rough treats it as part of the part.
+- Pockets treat it as an island.
+- Any other cut lifts over it.
+
+Untick the thread item and the hole is cut by the other operations again. Mill tabs don't apply to thread milling.
+
+### Mill tabs
+
+Right-click an edge and choose **Add mill tab**. This adds a rectangular tab standing up from the edge at the clicked point:
+
+- **Along the edge:** the width, along the edge's direction.
+- **Across the edge:** the depth.
+- **Z height:** how far the tab stands up from the edge.
+
+Every cut lifts over the tab, allowing for the cutter radius, so the part stays attached to the stock. Tabs are drawn as green boxes.
+
+## Simulator tab
+
+The Simulator plays a program against the stock and shows the material being cut away.
+
+### What to simulate
+
+- **Simulate:** **Step milling** or **Thread milling** (the current programs of those tabs), or a G-code file opened with **📂 Open G-code…**. Tools in a file are looked up in the tool table by number.
+- **Stock:** the step milling stock, or a box round the cutting moves. For thread milling the top of that box is the groups' Hole start Z. Tick **Custom stock** to type the box in yourself.
+- **Detail:** how fine the simulated stock is: Low, Medium, High or Fine, with 150 to 800 cells along its longer side. Higher detail shows small features better but redraws more slowly.
+- **⟲ Restart:** starts again with fresh stock.
+
+The simulation updates when the program, stock or tools change, and carries on from the same time.
+
+### Playback
+
+| Button | Key | What it does |
+|---|---|---|
+| ⏮ | Home | Back to the start |
+| ⏪ | ← | Previous move |
+| ▶ / ⏸ | Space | Play / pause |
+| ⏩ | → | Next move |
+| ⏭ | End | Run the whole program |
+
+- **Speed:** from 0.1× to 2000× machine time.
+- **Time slider:** drag it to scrub through the program.
+
+Times come from the run-time estimate, so the clock matches the estimated run time. Long programs can take a moment to catch up after a jump (*simulating…* appears in the Machine panel).
+
+### What you see
+
+- **Stock:** tan for uncut stock, bright for cut surfaces, dark where the tool has cut right through.
+- **Tool:** gold flutes and a grey shank, drawn at its current position.
+- **Path:** **All** shows the path done so far in colour and the rest faintly, **Done** shows only what has been cut, and **Off** hides it.
+- **G-code panel:** highlights the running line and scrolls with it while **Follow** is ticked. Click a line to run the simulation to the end of that line's move.
+- **Machine panel:** time, progress, line number, tool, rapid or feed, X Y Z, and material removed.
+
+### Compare with model
+
+For step milling the cut stock is compared with the model's top surface:
+
+- **green:** at size, within ± the tolerance (default 0.02 mm);
+- **yellow to orange:** stock left, from a little to 2 mm or more;
+- **red:** a gouge, where the tool cut into the part.
+
+The panel shows how much of the part's top area is at size, the most stock left, and any gouge depth. Untick **Colour by distance to the model** to see plain stock colours.
+
+### Warnings
+
+Problems are listed as the simulation reaches them. Press ⏭ to find them all, and click a warning to jump to it.
+
+- **Rapid through material:** a G0 move cut stock. On a real machine that's a crash.
+- **Deeper than the flutes:** the tool met material higher up than its flute length, either under the tool or in the wall beside it. The shank or holder would rub.
+- **Unknown tool:** a tool number that isn't in the tool table. It is simulated as a Ø3 end mill.
+- **G20 / G91:** inch or incremental programs aren't simulated correctly.
+
+### Limits
+
+- The stock is a height map, so undercuts can't be shown. A thread-milled hole shows as a plain bore at the thread's major Ø.
+- Engraving bits are drawn with a 1/8" shank.
+- Tool holders are not checked.
+
+## Tools & Settings tab
+
+### Machining settings
+
+- **Clearance above hole start Z (between holes):** how high the tool lifts between holes.
+- **Plunge feed.**
+- **Boring ring stepover (% of cutter Ø).**
+- **Max acceleration (run-time estimate):** default 200 mm/s².
+- **Rapid rate G0 (run-time estimate):** default 3000 mm/min.
+- **Coolant (M8):** coolant on during cutting.
+- **Tool length comp (G43 Hn):** adds `G43 Hn` after each tool change.
+
+### Tool tables
+
+Tool numbers must be unique across all three tables. Groups and operations follow their tool when you edit it.
+
+- **Milling cutters (end mills):** tool number, **Cutter Ø** and **Flute length**. **➕ Add cutter** adds one. The defaults are T1 to T5: 1×3, 1.5×6, 2×12, 3×17 and 3.175×17.
+- **Thread mills (single profile):** one for each thread size, with tool number, Ø (it must be smaller than the hole) and **Reach**. The defaults are T11 to T16 for M2 to M6.
+- **Engraving bits (tapered):** tool number, **Included angle** (the full angle of the cone), **Tip flat Ø** and **Max depth**. **➕ Add engraving bit** adds one. The defaults are T21 to T23: 30°, 60° and 90°, with 0.1, 0.2 and 0.3 mm tips.
+
+**Reset all settings to defaults** puts everything back.
+
+## The G-code
+
+- **Header:** `G21 G90 G17 G94 G40 G49 G80`, which means metric, absolute coordinates, XY plane, feed per minute, and no compensation or canned cycles.
+- **Tool changes:** `M5 M9` stops the spindle and coolant, the tool goes up to the rapid plane, then comes `Tn M6 (description)`, `G43 Hn` if tool length comp is on, `Sxxxx M3`, and `M8` if coolant is on.
+- **End of program:** `M5`, `M9`, `M30`.
+- **Moves:** only G0, G1, G2 and G3 (arcs use I/J), so nearly any controller can run the program.
+- **Comments** in brackets name each operation.
+
+**Estimated run time:** every move speeds up and slows down at the max acceleration, up to its feed or the rapid rate. Corners slow down as on a typical controller, so smooth paths keep their speed. Tool changes and spindle spin-up are not counted.
+
+## Mouse and keyboard
+
+| Input | Action |
+|---|---|
+| F1 | Open this help |
+| Left-drag | Orbit the 3D view |
+| Right-drag or middle-drag | Pan |
+| Scroll | Zoom at the cursor |
+| Double-click | Fit the view |
+| Click | Select a surface or an edge (Step Milling) |
+| Ctrl+click | Add or remove a hole from the selection |
+| Right-click | Operations menu (Step Milling) |
+| Esc | Clear the selection and the highlight |
+| ↑ / ↓ in the G-code panel | Highlight the move of each line |
+| Space / ← / → / Home / End | Simulator playback |
+
+## Troubleshooting
+
+- **"Cannot generate G-code":** the file bar lists each problem, for example a tool that isn't in the tool table, a cutter too big for the hole, or an empty location list. Fix them and the program reappears.
+- **The surface menu says "Only for surfaces normal to Z":** the model isn't sitting flat. Use **Lay flat on this surface** on its bottom face first.
+- **A hole won't thread mill:** it must be a full, vertical cylinder of a size within 0.3 mm of an M2 to M6 tap drill or major Ø. Bosses and partial cylinders don't qualify.
+- **The simulator shows a red gouge:** click the area's G-code line or use ⏪ / ⏩ to find the move. Check the operation's depths and tool, and the stock to leave.
+- **The simulator warns about the flute length:** use a longer tool, or set a smaller Bottom Z range for that tool.
+- **A job loads without its model:** the STEP file moved. Import it again. The placement and operations are kept.

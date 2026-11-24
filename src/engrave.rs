@@ -104,6 +104,8 @@ pub struct EngraveOp {
     /// Offset of the text anchor from the surface centre.
     pub x: f64,
     pub y: f64,
+    /// Text direction, degrees CCW from +X, turned about the anchor.
+    pub angle: f64,
     pub feed: f64,
     pub speed: f64,
 }
@@ -124,6 +126,7 @@ impl Default for EngraveOp {
             v_align: VAlign::Center,
             x: 0.0,
             y: 0.0,
+            angle: 0.0,
             feed: 300.0,
             speed: 12000.0,
         }
@@ -248,6 +251,9 @@ pub fn text_paths(op: &EngraveOp) -> Result<Vec<Vec<P2>>, String> {
         VAlign::Bottom => block - op.height,
     };
     let (ax, ay) = (op.origin[0] + op.x, op.origin[1] + op.y);
+    let (sa, ca) = op.angle.to_radians().sin_cos();
+    // text-space (u along the baseline, v up) to machine XY about the anchor
+    let place = |u: f64, v: f64| [ax + u * ca - v * sa, ay + u * sa + v * ca];
 
     let mut out = vec![];
     for (li, line) in lines.iter().enumerate() {
@@ -273,7 +279,7 @@ pub fn text_paths(op: &EngraveOp) -> Result<Vec<Vec<P2>>, String> {
         let base = first_base - line_h * li as f64;
         for (id, gx) in glyphs {
             for c in glyph_contours(&font, id, scale) {
-                out.push(c.iter().map(|p| [ax + x0 + (gx + p[0]) as f64 * scale, ay + base + p[1] as f64 * scale]).collect());
+                out.push(c.iter().map(|p| place(x0 + (gx + p[0]) as f64 * scale, base + p[1] as f64 * scale)).collect());
             }
         }
     }
@@ -313,6 +319,20 @@ mod tests {
         op.y = -3.0;
         let (lo, hi) = bounds(&text_paths(&op).unwrap());
         assert!(((lo[0] + hi[0]) / 2.0 - 55.0).abs() < 1.0 && (lo[1] - 17.0).abs() < 0.05, "{lo:?} {hi:?}");
+    }
+
+    #[test]
+    fn angle_turns_text_about_the_anchor() {
+        let base = EngraveOp { text: "HI".into(), height: 10.0, origin: [50.0, 20.0], h_align: HAlign::Left, v_align: VAlign::Bottom, ..Default::default() };
+        let (lo0, hi0) = bounds(&text_paths(&base).unwrap());
+        let w = hi0[0] - 50.0;
+        // 90 degrees: the baseline runs up +Y, the letters stand towards -X
+        let (lo, hi) = bounds(&text_paths(&EngraveOp { angle: 90.0, ..base.clone() }).unwrap());
+        assert!((hi[0] - 50.0).abs() < 0.05 && (lo[0] - 40.0).abs() < 0.05, "{lo:?} {hi:?}");
+        assert!((lo[1] - (20.0 + (lo0[0] - 50.0))).abs() < 0.05 && (hi[1] - (20.0 + w)).abs() < 0.05, "{lo:?} {hi:?}");
+        // 180 degrees: upside down, to the left of and below the anchor
+        let (lo, hi) = bounds(&text_paths(&EngraveOp { angle: 180.0, ..base }).unwrap());
+        assert!((hi[1] - 20.0).abs() < 0.05 && (lo[1] - 10.0).abs() < 0.05 && (lo[0] - (50.0 - w)).abs() < 0.05, "{lo:?} {hi:?}");
     }
 
     #[test]

@@ -3,7 +3,10 @@
 mod engrave;
 mod estimate;
 mod gcode;
+mod help;
 mod model;
+mod sim;
+mod simview;
 mod step;
 mod surface;
 mod stepmill;
@@ -30,6 +33,7 @@ fn main() -> eframe::Result<()> {
 enum Tab {
     ThreadMilling,
     StepMilling,
+    Simulator,
     Settings,
 }
 
@@ -85,8 +89,12 @@ struct StepCamApp {
     step_gcode_path: String,
     sel: Selection,
     menu_pick: Option<Pick>,
+    /// Model point under the cursor at the last right-click.
+    menu_point: Option<[f64; 3]>,
     /// Model faces for roughing (rebuilt when the model changes).
     rough_cache: Option<Vec<stepmill::RoughFace>>,
+    sim: simview::SimTab,
+    help: help::Help,
 }
 
 impl Default for StepCamApp {
@@ -123,7 +131,10 @@ impl Default for StepCamApp {
             step_gcode_path: "step.nc".into(),
             sel: Selection::default(),
             menu_pick: None,
+            menu_point: None,
             rough_cache: None,
+            sim: Default::default(),
+            help: Default::default(),
         }
     }
 }
@@ -281,8 +292,9 @@ impl StepCamApp {
         self.step_generated_from = Some((self.job.step.clone(), settings));
     }
 
+    /// The tab works with the step milling program (else thread milling).
     fn is_step_tab(&self) -> bool {
-        self.tab == Tab::StepMilling
+        self.tab == Tab::StepMilling || (self.tab == Tab::Simulator && self.sim.source != simview::Source::Thread)
     }
 
     fn save_gcode(&mut self) {
@@ -433,7 +445,7 @@ impl StepCamApp {
             }
             ui.separator();
             ui.label("G-code file:");
-            let path = if self.tab == Tab::StepMilling { &mut self.step_gcode_path } else { &mut self.gcode_path };
+            let path = if self.is_step_tab() { &mut self.step_gcode_path } else { &mut self.gcode_path };
             ui.add(egui::TextEdit::singleline(path).desired_width(220.0));
             if ui.button("💾 Save G-code").clicked() {
                 self.save_gcode();
@@ -748,6 +760,7 @@ impl StepCamApp {
         }
         if let Some(p) = out.right_pick {
             self.menu_pick = p;
+            self.menu_point = out.right_point;
         }
         let ops = &mut self.job.step.ops;
         let pick = self.menu_pick.clone();
@@ -755,11 +768,13 @@ impl StepCamApp {
         let placed = !self.job.step.placement.is_identity();
         let stock_top = stock.1[2];
         let sel_faces = self.sel.faces.clone();
+        let click = self.menu_point;
+        let reading = self.step_view.reading_angle();
         let settings = self.job.settings.clone();
         let mut action = None;
         let n_before = ops.len();
         out.response.context_menu(|ui| {
-            action = context_menu(ui, &model, &pick, ops, set_z, placed, stock_top, &sel_faces, &settings);
+            action = context_menu(ui, &model, &pick, ops, set_z, placed, stock_top, &sel_faces, &settings, click, reading);
         });
         // new ops default to a 3.175 cutter: use the closest one in the tool table
         let bits = &self.job.settings.engravers;
@@ -1117,7 +1132,18 @@ impl eframe::App for StepCamApp {
                 ui.separator();
                 ui.selectable_value(&mut self.tab, Tab::ThreadMilling, "Thread Milling");
                 ui.selectable_value(&mut self.tab, Tab::StepMilling, "Step Milling");
+                ui.selectable_value(&mut self.tab, Tab::Simulator, "Simulator");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Tools & Settings");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("❓ Help").on_hover_text("User guide for this tab (F1)").clicked() {
+                        self.help.open_at(match self.tab {
+                            Tab::ThreadMilling => "Thread Milling tab",
+                            Tab::StepMilling => "Step Milling tab",
+                            Tab::Simulator => "Simulator tab",
+                            Tab::Settings => "Tools & Settings tab",
+                        });
+                    }
+                });
             });
             ui.add_space(2.0);
             self.file_bar(ui);
@@ -1128,6 +1154,10 @@ impl eframe::App for StepCamApp {
             .resizable(true)
             .default_width(380.0)
             .show(ctx, |ui| {
+                if self.tab == Tab::Simulator {
+                    self.sim.code_panel(ui);
+                    return;
+                }
                 let step = self.tab == Tab::StepMilling;
                 let (code, view) = if step { (&self.step_gcode, &mut self.step_view) } else { (&self.gcode, &mut self.view) };
                 ui.horizontal(|ui| {
@@ -1158,8 +1188,22 @@ impl eframe::App for StepCamApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::ThreadMilling => self.thread_milling_tab(ui),
             Tab::StepMilling => self.step_milling_tab(ui),
+            Tab::Simulator => {
+                let step_stock = self.stock_box();
+                let thread_top = self.job.groups.iter().map(|g| g.start_z).reduce(f64::max);
+                let inp = simview::Inputs {
+                    step_code: if self.step_errors.is_empty() { &self.step_gcode } else { "" },
+                    thread_code: if self.gen_errors.is_empty() { &self.gcode } else { "" },
+                    settings: &self.job.settings,
+                    model: self.step_model.as_ref(),
+                    step_stock,
+                    thread_top,
+                };
+                self.sim.ui(ui, &inp);
+            }
             Tab::Settings => self.settings_tab(ui),
         });
+        self.help.show(ctx);
     }
 }
 
@@ -1402,6 +1446,15 @@ fn thread_ops(holes: &[Hole], s: &Settings) -> Vec<stepmill::ThreadOp> {
     out
 }
 
+/// A new engraving on face `fi`: anchored at the clicked point (as an offset
+/// from the surface centre), turned to `angle` degrees.
+fn new_engrave(fi: usize, f: &step::Face, click: Option<[f64; 3]>, angle: f64) -> EngraveOp {
+    let origin = face_center(f);
+    let round = |v: f64| (v * 1000.0).round() / 1000.0;
+    let (x, y) = click.map_or((0.0, 0.0), |p| (round(p[0] - origin[0]), round(p[1] - origin[1])));
+    EngraveOp { face_id: fi, z: f.z(), origin, x, y, angle, ..Default::default() }
+}
+
 /// Centre of a face's outer boundary (bounding box centre, XY).
 fn face_center(f: &step::Face) -> [f64; 2] {
     let pts = f.outer_loop().map(|l| l.pts.as_slice()).unwrap_or(&[]);
@@ -1418,6 +1471,7 @@ fn face_center(f: &step::Face) -> [f64; 2] {
 /// Returns warnings for operations that no longer make sense (they are disabled).
 fn refresh_ops(ops: &mut [StepOp], model: &step::Model, old: &step::Placement, new: &step::Placement) -> Vec<String> {
     let mut warnings = Vec::new();
+    let mut outline: Option<Vec<Vec<[f64; 2]>>> = None; // part outline, worked out once if needed
     let region = [model.min[0], model.min[1], model.max[0], model.max[1]];
     for (i, op) in ops.iter_mut().enumerate() {
         let face_any = op.face_id().and_then(|fi| model.faces.get(fi));
@@ -1429,6 +1483,7 @@ fn refresh_ops(ops: &mut [StepOp], model: &step::Model, old: &step::Placement, n
                     f.start_z += fc.z() - f.z;
                     f.z = fc.z();
                     f.region = region;
+                    f.outline = outline.get_or_insert_with(|| stepmill::part_outline(&stepmill::rough_faces(model))).clone();
                 }
                 None => ok = false,
             },
@@ -1516,6 +1571,8 @@ fn context_menu(
     stock_top: f64,
     sel_faces: &[usize],
     settings: &Settings,
+    click: Option<[f64; 3]>,
+    reading_angle: f64,
 ) -> Option<MenuAction> {
     // ops cutting from the part top start at the stock top instead
     let from_top = |start: f64| if start >= model.max[2] - 1e-6 { start.max(stock_top) } else { start };
@@ -1565,6 +1622,7 @@ fn context_menu(
                             face_id: *fi,
                             z,
                             region: [model.min[0], model.min[1], model.max[0], model.max[1]],
+                            outline: stepmill::part_outline(&stepmill::rough_faces(model)),
                             start_z: if stock_top > z + 1e-6 { stock_top } else { z + 1.0 },
                             ..Default::default()
                         }),
@@ -1577,8 +1635,12 @@ fn context_menu(
                     }
                     ui.close_menu();
                 }
-                if ui.button("Engrave text").on_hover_text("Engrave text into this surface, positioned from its centre").clicked() {
-                    ops.push(StepOp { enabled: true, kind: OpKind::Engrave(EngraveOp { face_id: *fi, z: f.z(), origin: face_center(f), ..Default::default() }) });
+                if ui
+                    .button("Engrave text")
+                    .on_hover_text("Engrave text into this surface at the clicked point, reading left to right in the current view (to the nearest 90°)")
+                    .clicked()
+                {
+                    ops.push(StepOp { enabled: true, kind: OpKind::Engrave(new_engrave(*fi, f, click, reading_angle)) });
                     ui.close_menu();
                 }
             } else if f.planar && f.normal[2] > 1e-6 {
@@ -1750,7 +1812,7 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
             cutter_combo(ui, i, &mut f.cutter, cutters);
             num(ui, "Stepover", &mut f.stepover_pct, 0.5, " %", "% of cutter diameter");
             num(ui, "Depth per pass", &mut f.depth_per_pass, 0.05, " mm", "");
-            num(ui, "Overlap outside part", &mut f.overlap, 0.1, " mm", "How far the cutter edge runs past the part");
+            num(ui, "Extra past outline", &mut f.overlap, 0.1, " mm", "Facing clears everything above the surface inside the part's outside profile offset outwards by half the tool diameter; this goes further out still (default 0)");
             num(ui, "Feed", &mut f.feed, 1.0, " mm/min", "");
             num(ui, "Speed", &mut f.speed, 10.0, " rpm", "");
             num(ui, "Start Z", &mut f.start_z, 0.1, " mm", "Top of the stock");
@@ -1877,10 +1939,10 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
             ui.end_row();
             ui.label("Stock facing");
             match r.facing_z() {
-                Some(z) => ui.label(format!("whole stock from Z{} to Z{} first", gcode::fmt(r.start_z), gcode::fmt(z))),
+                Some(z) => ui.label(format!("from Z{} to Z{} first", gcode::fmt(r.start_z), gcode::fmt(z))),
                 None => ui.weak("none - stock is not above the part top + stock to leave"),
             }
-            .on_hover_text("When the stock is taller than the part, roughing first faces the whole stock (with overlap past its edges) down to the part top + stock to leave, in layer-height steps");
+            .on_hover_text("When the stock is taller than the part, roughing first faces it down to the part top + stock to leave, in layer-height steps, inside the part's outside profile offset outwards by half the tool diameter");
             ui.end_row();
         }
         OpKind::Engrave(g) => {
@@ -1944,8 +2006,9 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
                 ui.radio_value(&mut g.v_align, VAlign::Bottom, "Bottom").on_hover_text("Baseline of the last line on the anchor point");
             });
             ui.end_row();
-            num(ui, "X", &mut g.x, 0.1, " mm", "Anchor point, from the centre of the surface");
-            num(ui, "Y", &mut g.y, 0.1, " mm", "Anchor point, from the centre of the surface");
+            num(ui, "X", &mut g.x, 0.1, " mm", "Anchor point, from the centre of the surface (default: where you right-clicked)");
+            num(ui, "Y", &mut g.y, 0.1, " mm", "Anchor point, from the centre of the surface (default: where you right-clicked)");
+            num(ui, "Angle", &mut g.angle, 1.0, "°", "Text direction, counter-clockwise from +X, turned about the anchor point (default: reading left to right in the view, to the nearest 90°)");
             num(ui, "Feed", &mut g.feed, 1.0, " mm/min", "Plunges at half this feed");
             num(ui, "Speed", &mut g.speed, 10.0, " rpm", "");
             ui.label("Surface");
@@ -2251,5 +2314,28 @@ mod alike_tests {
         let (small, _) = alike_holes(&m, 6, &[]);
         assert_eq!(small.len(), 1);
         assert_eq!(thread_ops(&small, &Settings::default())[0].group.thread, ThreadSize::M3);
+    }
+}
+
+#[cfg(test)]
+mod engrave_place_tests {
+    use super::*;
+
+    #[test]
+    fn engraving_starts_at_the_click_and_view_angle() {
+        let m = step::parse_model(include_str!("../testdata/pocket_block.step")).unwrap();
+        let top = m.faces.iter().position(|f| f.is_up_horizontal() && f.z().abs() < 1e-9).unwrap();
+        let f = &m.faces[top];
+        let c = face_center(f);
+        let g = new_engrave(top, f, Some([c[0] + 7.25, c[1] - 3.5, 0.0]), 270.0);
+        assert!((g.x - 7.25).abs() < 1e-9 && (g.y + 3.5).abs() < 1e-9 && g.angle == 270.0);
+        // the text's anchor is the clicked point
+        // (an H: its left stem starts right at the baseline start)
+        let p = engrave::text_paths(&EngraveOp { text: "H".into(), h_align: engrave::HAlign::Left, v_align: engrave::VAlign::Bottom, ..g.clone() }).unwrap();
+        let near = p.iter().flatten().map(|q| (q[0] - (c[0] + 7.25)).hypot(q[1] - (c[1] - 3.5))).fold(f64::INFINITY, f64::min);
+        assert!(near < 1.0, "text starts {near} mm from the click"); // the font side bearing
+        // no click point: the surface centre
+        let g = new_engrave(top, f, None, 0.0);
+        assert!(g.x == 0.0 && g.y == 0.0);
     }
 }
