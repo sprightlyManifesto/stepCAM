@@ -65,6 +65,8 @@ pub struct SimTool {
     pub name: String,
     /// Found in the tool tables (else a stand-in Ø3 end mill).
     pub known: bool,
+    /// A thread mill: its feed moves are threading.
+    pub thread: bool,
 }
 
 /// Shank of engraving bits (1/8").
@@ -73,20 +75,20 @@ const ENGRAVER_SHANK_R: f64 = 1.5875;
 /// The tool with machine number `t` from the three tool tables.
 pub fn tool_for(s: &Settings, t: u32) -> SimTool {
     if let Some(c) = s.cutters.iter().find(|c| c.tool == t) {
-        return SimTool { number: t, shape: Shape::Flat { r: c.dia / 2.0 }, flute: c.flute, name: format!("T{t} end mill Ø{}", crate::gcode::fmt(c.dia)), known: true };
+        return SimTool { number: t, shape: Shape::Flat { r: c.dia / 2.0 }, flute: c.flute, name: format!("T{t} end mill Ø{}", crate::gcode::fmt(c.dia)), known: true, thread: false };
     }
     for (i, m) in s.thread_mills.iter().enumerate() {
         let n = if m.tool == 0 { 11 + i as u32 } else { m.tool };
         if n == t {
-            return SimTool { number: t, shape: Shape::Flat { r: m.dia / 2.0 }, flute: m.reach, name: format!("T{t} thread mill Ø{}", crate::gcode::fmt(m.dia)), known: true };
+            return SimTool { number: t, shape: Shape::Flat { r: m.dia / 2.0 }, flute: m.reach, name: format!("T{t} thread mill Ø{}", crate::gcode::fmt(m.dia)), known: true, thread: true };
         }
     }
     if let Some(e) = s.engravers.iter().find(|e| e.tool == t) {
         let tan = (e.angle.clamp(1.0, 179.0).to_radians() / 2.0).tan();
         let r = ENGRAVER_SHANK_R.max(e.width_at(e.max_depth) / 2.0).max(e.tip / 2.0 + 0.01);
-        return SimTool { number: t, shape: Shape::Vee { tip: e.tip / 2.0, tan, r }, flute: e.max_depth, name: format!("T{t} engraver {}", e.name()), known: true };
+        return SimTool { number: t, shape: Shape::Vee { tip: e.tip / 2.0, tan, r }, flute: e.max_depth, name: format!("T{t} engraver {}", e.name()), known: true, thread: false };
     }
-    SimTool { number: t, shape: Shape::Flat { r: 1.5 }, flute: 1e9, name: format!("T{t} (not in tool table, shown as Ø3)"), known: false }
+    SimTool { number: t, shape: Shape::Flat { r: 1.5 }, flute: 1e9, name: format!("T{t} (not in tool table, shown as Ø3)"), known: false, thread: false }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -535,6 +537,14 @@ impl ZMap {
     }
 }
 
+/// The model's triangles that can be its top surface seen from above:
+/// flat faces facing down are left out, so cells in slivers between two
+/// faces' tessellations (where no top face covers them) are not compared
+/// against the part's underside.
+pub fn top_tris(model: &crate::step::Model) -> impl Iterator<Item = &[P3; 3]> {
+    model.faces.iter().filter(|f| !(f.planar && f.normal[2] < -1e-6)).flat_map(|f| f.tris.iter())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EventKind {
     /// A rapid (G0) move went through material.
@@ -827,7 +837,7 @@ mod tests {
         assert!(sim.removed() > 100.0);
         assert!(!sim.events.values().any(|e| e.kind == EventKind::RapidCut), "{:?}", sim.events);
         // and the part is not gouged: material everywhere at or above the model top
-        let part = sim.map.surface_of(model.faces.iter().flat_map(|f| f.tris.iter()));
+        let part = sim.map.surface_of(top_tris(&model));
         let worst = sim.map.z.iter().zip(&part).filter(|(_, p)| !p.is_nan()).map(|(z, p)| p - z).fold(0f32, f32::max);
         assert!(worst < 0.07, "gouge {worst}");
     }

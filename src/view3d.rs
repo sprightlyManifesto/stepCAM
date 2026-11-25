@@ -10,15 +10,6 @@ use crate::toolpath::{MoveKind, Toolpath};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use std::f32::consts::{FRAC_PI_2, PI};
 
-/// Hole outline drawn as a wireframe cylinder.
-pub struct HoleViz {
-    pub x: f32,
-    pub y: f32,
-    pub dia: f32,
-    pub top: f32,
-    pub bottom: f32,
-}
-
 /// A STEP model to draw (and pick from), with the current selection.
 pub struct ModelViz<'a> {
     pub model: &'a Model,
@@ -58,7 +49,6 @@ pub struct View3d {
     pub show_rapid: bool,
     pub show_bore: bool,
     pub show_thread: bool,
-    pub show_holes: bool,
     pub show_model: bool,
     pub needs_fit: bool,
     /// Legend labels for the two feed move kinds; empty hides the toggle.
@@ -77,10 +67,9 @@ impl Default for View3d {
             show_rapid: true,
             show_bore: true,
             show_thread: true,
-            show_holes: true,
             show_model: true,
             needs_fit: true,
-            labels: ["Hole milling", "Threading"],
+            labels: ["Milling", "Threading"],
             highlight_line: None,
         };
         v.iso();
@@ -90,9 +79,9 @@ impl Default for View3d {
 
 /// Highlighted G-code move (cyan).
 const HIGHLIGHT: Color32 = Color32::from_rgb(0, 230, 255);
-const RAPID: Color32 = Color32::from_rgba_premultiplied(150, 50, 50, 150);
-const BORE: Color32 = Color32::from_rgb(70, 150, 255);
-const THREAD: Color32 = Color32::from_rgb(255, 165, 40);
+pub(crate) const RAPID: Color32 = Color32::from_rgba_premultiplied(150, 50, 50, 150);
+pub(crate) const BORE: Color32 = Color32::from_rgb(70, 150, 255);
+pub(crate) const THREAD: Color32 = Color32::from_rgb(255, 165, 40);
 const SELECT: Color32 = Color32::from_rgb(255, 220, 0);
 const TAB: Color32 = Color32::from_rgb(60, 200, 90);
 
@@ -108,10 +97,6 @@ fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> (f32, f32) {
 }
 
 impl View3d {
-    pub fn with_labels(labels: [&'static str; 2]) -> Self {
-        View3d { labels, ..Default::default() }
-    }
-
     fn iso(&mut self) {
         self.yaw = -PI / 6.0;
         self.pitch = PI / 3.5;
@@ -360,7 +345,7 @@ impl View3d {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, tp: &Toolpath, holes: &[HoleViz], model: Option<&ModelViz>) -> ViewOut {
+    pub fn ui(&mut self, ui: &mut egui::Ui, tp: &Toolpath, model: Option<&ModelViz>) -> ViewOut {
         // bounds of everything drawable
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
@@ -373,11 +358,6 @@ impl View3d {
         if !tp.is_empty() {
             grow(tp.min);
             grow(tp.max);
-        }
-        for h in holes {
-            let r = h.dia / 2.0;
-            grow([h.x - r, h.y - r, h.bottom]);
-            grow([h.x + r, h.y + r, h.top]);
         }
         if let Some(mv) = model {
             grow(f3(mv.model.min));
@@ -397,8 +377,6 @@ impl View3d {
             }
             if model.is_some() {
                 ui.checkbox(&mut self.show_model, "Model");
-            } else {
-                ui.checkbox(&mut self.show_holes, "Holes");
             }
             ui.separator();
             self.view_buttons(ui);
@@ -438,7 +416,7 @@ impl View3d {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                if model.is_some() || self.labels[1].is_empty() { "Import a STEP file to begin" } else { "No toolpath - add locations to a valid group" },
+                "Import a STEP file to begin",
                 egui::FontId::proportional(14.0),
                 ui.visuals().weak_text_color(),
             );
@@ -446,47 +424,11 @@ impl View3d {
         }
 
         // ground grid on the XY plane
-        let grid_z = match model {
-            Some(mv) => mv.model.min[2] as f32,
-            None => {
-                let z = holes.iter().map(|h| h.top).fold(f32::NEG_INFINITY, f32::max);
-                if z.is_finite() {
-                    z
-                } else {
-                    0.0
-                }
-            }
-        };
+        let grid_z = model.map_or(tp.min[2], |mv| mv.model.min[2] as f32);
         self.draw_grid(ui, &painter, rect, min, max, grid_z);
 
         if let (Some(mv), true) = (model, self.show_model) {
             self.draw_model(ui, &painter, rect, mv);
-        }
-
-        if self.show_holes && model.is_none() {
-            let col = ui.visuals().text_color().gamma_multiply(0.35);
-            let stroke = Stroke::new(1.0_f32, col);
-            for h in holes {
-                let r = h.dia / 2.0;
-                let circle = |z: f32| -> Vec<Pos2> {
-                    (0..=32)
-                        .map(|k| {
-                            let a = k as f32 / 32.0 * 2.0 * PI;
-                            self.project(rect, [h.x + r * a.cos(), h.y + r * a.sin(), z])
-                        })
-                        .collect()
-                };
-                painter.add(Shape::line(circle(h.top), stroke));
-                painter.add(Shape::line(circle(h.bottom), stroke));
-                for k in 0..4 {
-                    let a = k as f32 * FRAC_PI_2 + self.yaw;
-                    let (dx, dy) = (r * a.cos(), r * a.sin());
-                    painter.line_segment(
-                        [self.project(rect, [h.x + dx, h.y - dy, h.top]), self.project(rect, [h.x + dx, h.y - dy, h.bottom])],
-                        stroke,
-                    );
-                }
-            }
         }
 
         for (kind, show, color, width) in [

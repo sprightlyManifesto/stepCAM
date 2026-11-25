@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn guide_has_a_section_for_every_tab() {
         let h = Help::default();
-        for tab in ["Thread Milling tab", "Step Milling tab", "Simulator tab", "Tools & Settings tab", "Getting started"] {
+        for tab in ["Step Milling tab", "Simulator tab", "Tools & Settings tab", "Getting started"] {
             let mut h2 = Help { blocks: h.blocks.clone(), ..Default::default() };
             h2.open_at(tab);
             assert!(h2.jump.is_some(), "no section {tab}");

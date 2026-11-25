@@ -18,7 +18,7 @@
 //!             // z: model | stock_top | stock_base | custom; "at": [x, y, z] for custom axes
 //!   "settings_file": "stepcam-settings.json",                // optional
 //!   "settings": {"spindle_rpm": 12000, ...},                 // optional overrides
-//!   "ops": [ {"type": "rough" | "face" | "pocket" | "profile" | "engrave" |
+//!   "ops": [ {"type": "rough" | "finish" | "face" | "pocket" | "profile" | "engrave" |
 //!                     "thread" | "thread_alike" | "tab",
 //!             "picks": [{"point": [x,y,z], "normal": [..]?, "tangent": [..]?}, ...],
 //!             "on": "face" | "edge",                         // pocket only
@@ -203,6 +203,9 @@ fn run(spec: &Spec) -> (Value, i32) {
         return fail(errors);
     }
 
+    for (k, w) in stepmill::finish_warnings(&job.ops) {
+        warnings.push(format!("operation {} ({}): {w}", k + 1, job.ops[k].label()));
+    }
     // the rapid plane as on the Step Milling tab
     let mut gen_settings = settings.clone();
     gen_settings.safe_z = model.max[2].max(stock_top) + job.rapid_above;
@@ -252,7 +255,7 @@ fn simulate(code: &str, s: &Settings, stock: ([f64; 3], [f64; 3]), model: &step:
     prog.translate(origin);
     let mut sm = sim::Sim::new(prog, stock.0, stock.1, spec.detail.clamp(20, 2000));
     while !sm.seek(f64::INFINITY, std::time::Duration::from_secs(3600)) {}
-    let part = sm.map.surface_of(model.faces.iter().flat_map(|f| f.tris.iter()));
+    let part = sm.map.surface_of(sim::top_tris(model));
     let tol = spec.tolerance as f32;
     let (mut cells, mut at, mut gouged, mut gouge, mut left) = (0usize, 0usize, 0usize, 0f32, 0f32);
     let mut worst: Option<[f64; 3]> = None;
@@ -345,6 +348,7 @@ fn build(o: &OpSpec, model: &step::Model, stock: ([f64; 3], [f64; 3]), stock_top
     };
     Ok(match o.kind.as_str() {
         "rough" => vec![OpKind::Rough(crate::rough_op(model, stock, s))],
+        "finish" => vec![OpKind::Finish(crate::finish_op(model, stock, s))],
         "face" => faces()?.into_iter().map(|fi| up_flat(fi).map(|_| OpKind::Face(crate::face_op(model, fi, stock_top)))).collect::<Result<_, _>>()?,
         "pocket" => match o.on.as_deref() {
             Some("edge") => chains(edges()?).into_iter().map(|e| crate::edge_pocket(model, e, stock_top).map(OpKind::Pocket)).collect::<Result<_, _>>()?,
@@ -391,7 +395,7 @@ fn build(o: &OpSpec, model: &step::Model, stock: ([f64; 3], [f64; 3]), stock_top
             v
         }
         "tab" => edges()?.into_iter().map(|(e, p, a)| OpKind::Tab(crate::mill_tab(model, e, p, a))).collect(),
-        k => return Err(format!("unknown operation type {k:?} (rough, face, pocket, profile, engrave, thread, thread_alike, tab)")),
+        k => return Err(format!("unknown operation type {k:?} (rough, finish, face, pocket, profile, engrave, thread, thread_alike, tab)")),
     })
 }
 
@@ -575,7 +579,20 @@ fn apply_params(kind: OpKind, params: &Map<String, Value>, s: &Settings) -> Resu
             if let Some(t) = &tool {
                 o.cutter = cutter(t)?;
             }
-            OpKind::Rough(merge(&o, &p, "rough")?)
+            // the faces' meshes are not serialised: keep them
+            let faces = o.faces.clone();
+            let mut n: crate::stepmill::RoughOp = merge(&o, &p, "rough")?;
+            n.faces = faces;
+            OpKind::Rough(n)
+        }
+        OpKind::Finish(mut o) => {
+            if let Some(t) = &tool {
+                o.cutter = cutter(t)?;
+            }
+            let faces = o.faces.clone();
+            let mut n: crate::stepmill::RoughOp = merge(&o, &p, "finish")?;
+            n.faces = faces;
+            OpKind::Finish(n)
         }
         OpKind::Engrave(mut o) => {
             if let Some(t) = &tool {
@@ -730,6 +747,29 @@ mod tests {
         assert_eq!(b["gouged_cells"], 0);
         let custom = run_with(json!({"xy": "custom", "z": "custom", "at": [1, 2, 3]}));
         assert_eq!(custom["origin"], json!([1.0, 2.0, 3.0]));
+    }
+
+    #[test]
+    fn parameters_keep_the_curved_faces_meshes() {
+        // a.step's fillet and chamfer are curved: setting a rough parameter
+        // must not drop their meshes (job files leave them out)
+        let mut sp: Spec = serde_json::from_value(json!({
+            "step": "testdata/a.step", "stock": {"x": 10, "y": 10, "z": 1},
+            "ops": [{"type": "rough", "params": {"tool": 4, "strategy": "adaptive"}}, {"type": "finish", "params": {"tool": 4}}],
+            "simulate": {"detail": 250}
+        }))
+        .unwrap();
+        sp.gcode_out = None;
+        let model = step::load("testdata/a.step").unwrap();
+        let stock = Stock { x: 10.0, y: 10.0, z: 1.0, ..Default::default() }.bounds(model.min, model.max);
+        let built = build(&sp.ops[0], &model, stock, stock.1[2], &Settings::default(), &[]).unwrap().remove(0);
+        let OpKind::Rough(r) = apply_params(built, &sp.ops[0].params, &Settings::default()).unwrap() else { panic!() };
+        assert!(r.faces.iter().any(|f| f.curved && !f.tris.is_empty()));
+        let (rep, code) = run(&sp);
+        assert_eq!(code, 0, "{rep:#}");
+        let sim = &rep["simulation"];
+        assert_eq!(sim["gouged_cells"], 0, "{sim}");
+        assert_eq!(sim["events"], json!([]), "{sim}");
     }
 
     #[test]

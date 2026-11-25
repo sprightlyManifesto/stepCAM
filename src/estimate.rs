@@ -237,7 +237,7 @@ mod tests {
     fn real_program_is_between_instant_and_stop_at_every_move() {
         let mut job = crate::model::Job::default();
         job.groups.push(crate::model::ThreadGroup { locations: "10, 10\n20, 10\n30, 25\n".into(), ..Default::default() });
-        let code = crate::gcode::generate(&job).unwrap();
+        let code = crate::gcode::tests::generate(&job).unwrap();
         let (rapid, a) = (3000.0, 200.0);
         let segs = segments(&code, rapid);
         let lo: f64 = segs.iter().map(|s| s.len / s.vmax).sum();

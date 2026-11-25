@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Source {
     Step,
-    Thread,
     File,
 }
 
@@ -55,13 +54,10 @@ impl Detail {
 /// What the tab simulates.
 pub struct Inputs<'a> {
     pub step_code: &'a str,
-    pub thread_code: &'a str,
     pub settings: &'a Settings,
     pub model: Option<&'a crate::step::Model>,
     /// Step milling stock box.
     pub step_stock: Option<(P3, P3)>,
-    /// Highest thread group start Z (thread milling stock top).
-    pub thread_top: Option<f64>,
     /// Step milling program zero (model coordinates): the step program is
     /// relative to it, so its moves are mapped back before simulating.
     pub step_origin: P3,
@@ -96,6 +92,10 @@ pub struct SimTab {
     last_frame: Option<Instant>,
     path: PathShow,
     show_tool: bool,
+    /// Path kinds shown: rapids, milling, threading.
+    show_rapid: bool,
+    show_mill: bool,
+    show_thread: bool,
     show_stock: bool,
     compare: bool,
     /// At-size band of the comparison (mm).
@@ -131,6 +131,9 @@ impl Default for SimTab {
             last_frame: None,
             path: PathShow::All,
             show_tool: true,
+            show_rapid: true,
+            show_mill: true,
+            show_thread: true,
             show_stock: true,
             compare: true,
             tol: 0.02,
@@ -155,8 +158,6 @@ const AT_SIZE: Color32 = Color32::from_rgb(70, 190, 95);
 const GOUGE: Color32 = Color32::from_rgb(225, 55, 45);
 const LEFT_LO: Color32 = Color32::from_rgb(235, 215, 70);
 const LEFT_HI: Color32 = Color32::from_rgb(240, 135, 45);
-const PATH_FEED: Color32 = Color32::from_rgb(70, 150, 255);
-const PATH_RAPID: Color32 = Color32::from_rgba_premultiplied(170, 50, 50, 170);
 const FLUTES: Color32 = Color32::from_rgba_premultiplied(215, 175, 60, 235);
 const SHANK: Color32 = Color32::from_rgba_premultiplied(140, 142, 150, 235);
 const WARN: Color32 = Color32::from_rgb(240, 150, 40);
@@ -201,7 +202,6 @@ impl SimTab {
     fn code<'a>(&'a self, inp: &Inputs<'a>) -> &'a str {
         match self.source {
             Source::Step => inp.step_code,
-            Source::Thread => inp.thread_code,
             Source::File => &self.file_code,
         }
     }
@@ -217,7 +217,6 @@ impl SimTab {
         let r = prog.tools.iter().map(|t| t.shape.radius()).fold(0.0, f64::max);
         let m = r + 2.0;
         let top = match self.source {
-            Source::Thread => inp.thread_top.unwrap_or(hi[2]),
             _ if lo[2] < -1e-6 => 0.0,
             _ => hi[2],
         };
@@ -273,7 +272,7 @@ impl SimTab {
         let sim = Sim::new(prog, lo, hi, self.detail.cells());
         if self.source == Source::Step {
             if let Some(m) = inp.model {
-                self.part = Some(sim.map.surface_of(m.faces.iter().flat_map(|f| f.tris.iter())));
+                self.part = Some(sim.map.surface_of(crate::sim::top_tris(m)));
             }
         }
         self.target = keep.min(sim.prog.total);
@@ -382,7 +381,6 @@ impl SimTab {
             ui.label("Simulate:");
             let before = self.source;
             ui.selectable_value(&mut self.source, Source::Step, "Step milling");
-            ui.selectable_value(&mut self.source, Source::Thread, "Thread milling");
             ui.add_enabled_ui(!self.file_code.is_empty(), |ui| {
                 ui.selectable_value(&mut self.source, Source::File, if self.file_name.is_empty() { "File".to_string() } else { self.file_name.clone() });
             });
@@ -474,7 +472,6 @@ impl SimTab {
         if prog.pieces.is_empty() {
             ui.weak(match self.source {
                 Source::Step => "No step milling G-code yet - import a model and add operations (or fix the errors on the Step Milling tab).",
-                Source::Thread => "No thread milling G-code - add a valid group on the Thread Milling tab.",
                 Source::File => "The file has no moves.",
             });
             return;
@@ -624,6 +621,11 @@ impl SimTab {
             ui.selectable_value(&mut self.path, PathShow::All, "All");
             ui.selectable_value(&mut self.path, PathShow::Done, "Done");
             ui.selectable_value(&mut self.path, PathShow::Off, "Off");
+            ui.add_enabled_ui(self.path != PathShow::Off, |ui| {
+                ui.checkbox(&mut self.show_rapid, egui::RichText::new("Rapids").color(crate::view3d::RAPID.to_opaque()));
+                ui.checkbox(&mut self.show_mill, egui::RichText::new("Milling").color(crate::view3d::BORE));
+                ui.checkbox(&mut self.show_thread, egui::RichText::new("Threading").color(crate::view3d::THREAD));
+            });
             ui.separator();
             ui.checkbox(&mut self.show_tool, "Tool");
             ui.checkbox(&mut self.show_stock, "Stock");
@@ -651,13 +653,14 @@ impl SimTab {
         let part = if self.compare { self.part.as_deref() } else { None };
         let tol = self.tol as f32;
         let (path, show_tool, show_stock, origin) = (self.path, self.show_tool, self.show_stock, self.origin);
+        let kinds = PathKinds { rapid: self.show_rapid, mill: self.show_mill, thread: self.show_thread };
         let grid_z = m.bottom as f32;
         self.view.scene(ui, f3(lo), f3(hi), grid_z, |v, painter, rect| {
             if show_stock && m.nx > 2 {
                 draw_stock(v, painter, rect, sim, order, part, tol);
             }
             if path != PathShow::Off {
-                draw_path(v, painter, rect, sim, path == PathShow::All);
+                draw_path(v, painter, rect, sim, path == PathShow::All, kinds);
             }
             if let Some(o) = origin {
                 v.draw_origin(painter, rect, f3(o));
@@ -828,8 +831,33 @@ fn draw_stock(v: &View3d, painter: &egui::Painter, rect: Rect, sim: &Sim, order:
     painter.add(egui::Shape::mesh(mesh));
 }
 
-/// Path done so far (bright) and, with `all`, the rest (faint).
-fn draw_path(v: &View3d, painter: &egui::Painter, rect: Rect, sim: &Sim, all: bool) {
+/// Which kinds of move the path shows.
+#[derive(Clone, Copy)]
+struct PathKinds {
+    rapid: bool,
+    mill: bool,
+    thread: bool,
+}
+
+/// A piece's kind: rapid, milling (feed) or threading (feed with a thread mill).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PathKind {
+    Rapid,
+    Mill,
+    Thread,
+}
+
+fn path_kind(sim: &Sim, p: &crate::sim::Piece) -> PathKind {
+    match p.motion {
+        Motion::Rapid => PathKind::Rapid,
+        Motion::Feed if p.tool.is_some_and(|t| sim.prog.tools[t].thread) => PathKind::Thread,
+        Motion::Feed => PathKind::Mill,
+    }
+}
+
+/// Path done so far (bright) and, with `all`, the rest (faint), for the
+/// kinds of move switched on.
+fn draw_path(v: &View3d, painter: &egui::Painter, rect: Rect, sim: &Sim, all: bool, kinds: PathKinds) {
     let ps = &sim.prog.pieces;
     let cut = sim.done.min(ps.len());
     let now = sim.position();
@@ -841,17 +869,29 @@ fn draw_path(v: &View3d, painter: &egui::Painter, rect: Rect, sim: &Sim, all: bo
         }
         run.clear();
     };
-    let style = |m: Motion, done: bool| -> Stroke {
-        match (m, done) {
-            (Motion::Feed, true) => Stroke::new(1.3_f32, PATH_FEED),
-            (Motion::Rapid, true) => Stroke::new(1.0_f32, PATH_RAPID),
-            (Motion::Feed, false) => Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(150, 170, 200, 60)),
-            (Motion::Rapid, false) => Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(200, 90, 90, 45)),
+    // the same colours as the Step Milling view; what is still to come is faint
+    let style = |k: PathKind, done: bool| -> Stroke {
+        match (k, done) {
+            (PathKind::Rapid, true) => Stroke::new(1.0_f32, crate::view3d::RAPID),
+            (PathKind::Mill, true) => Stroke::new(1.3_f32, crate::view3d::BORE),
+            (PathKind::Thread, true) => Stroke::new(1.5_f32, crate::view3d::THREAD),
+            (PathKind::Rapid, false) => Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(200, 90, 90, 45)),
+            (PathKind::Mill, false) => Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(150, 170, 200, 60)),
+            (PathKind::Thread, false) => Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 190, 110, 70)),
         }
+    };
+    let shown = |k: PathKind| match k {
+        PathKind::Rapid => kinds.rapid,
+        PathKind::Mill => kinds.mill,
+        PathKind::Thread => kinds.thread,
     };
     let end = if all { ps.len() } else { (cut + 1).min(ps.len()) };
     let mut last_b: Option<P3> = None;
     for (k, p) in ps.iter().enumerate().take(end) {
+        let kind = path_kind(sim, p);
+        if !shown(kind) {
+            continue;
+        }
         // the running piece splits at the tool
         let mut parts = [(p.a, p.b, k < cut); 2];
         let n = if k == cut {
@@ -870,7 +910,7 @@ fn draw_path(v: &View3d, painter: &egui::Painter, rect: Rect, sim: &Sim, all: bo
             1
         };
         for &(a, b, done) in &parts[..n] {
-            let s = style(p.motion, done);
+            let s = style(kind, done);
             if run_style != Some(s) || last_b != Some(a) {
                 flush(&mut run, run_style);
                 run_style = Some(s);
@@ -982,7 +1022,7 @@ mod tests {
         let job = StepJob { ops: vec![StepOp { enabled: true, kind: OpKind::Rough(op) }], ..Default::default() };
         let s = Settings { safe_z: 25.0, ..Default::default() };
         let code = generate(&job, &s).unwrap();
-        let inp = Inputs { step_code: &code, thread_code: "", settings: &s, model: Some(&model), step_stock: Some(stock), thread_top: None, step_origin: [0.0; 3] };
+        let inp = Inputs { step_code: &code, settings: &s, model: Some(&model), step_stock: Some(stock), step_origin: [0.0; 3] };
         let ctx = egui::Context::default();
         let mut tab = SimTab::default();
         let mut frame = |tab: &mut SimTab| {
@@ -1024,10 +1064,20 @@ mod tests {
         frame(&mut tab);
         frame(&mut tab);
         assert!((tab.sim.as_ref().unwrap().map.top - tab.stock.1[2]).abs() < 1e-9);
-        // nothing to simulate
-        tab.source = Source::Thread;
+        // nothing to simulate: an empty file
+        tab.source = Source::File;
         frame(&mut tab);
         assert!(tab.sim.as_ref().unwrap().prog.pieces.is_empty());
+    }
+
+    #[test]
+    fn thread_mill_feeds_are_threading() {
+        // T4 end mill bores, T13 (M3 thread mill) threads
+        let code = "T4 M6\nG0 X5 Y5 Z1\nG1 Z-1 F100\nT13 M6\nG0 X5 Y5 Z1\nG1 Z-1 F100\nG0 Z5\n";
+        let sim = Sim::new(Program::parse(code, &Settings::default()), [0.0; 3], [10.0, 10.0, 0.0], 50);
+        let kinds: Vec<PathKind> = sim.prog.pieces.iter().map(|p| path_kind(&sim, p)).collect();
+        // (the first move has no known start, so it is not a piece)
+        assert_eq!(kinds, vec![PathKind::Mill, PathKind::Rapid, PathKind::Thread, PathKind::Rapid]);
     }
 
     #[test]

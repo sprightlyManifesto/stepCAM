@@ -47,7 +47,6 @@ fn main() -> eframe::Result<()> {
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
-    ThreadMilling,
     StepMilling,
     Simulator,
     Settings,
@@ -71,20 +70,11 @@ enum OpAction {
 struct StepCamApp {
     job: Job,
     tab: Tab,
-    gcode: String,
-    /// Errors from the last (automatic) generation.
-    gen_errors: Vec<String>,
-    /// Estimated run time of `gcode` / `step_gcode` (s).
-    gcode_time: f64,
+    /// Estimated run time of `step_gcode` (s).
     step_gcode_time: f64,
-    /// Job the current G-code was generated from.
-    generated_from: Option<Job>,
-    toolpath: toolpath::Toolpath,
-    view: view3d::View3d,
     status: String,
     status_is_error: bool,
     job_path: String,
-    gcode_path: String,
 
     // step milling
     /// Model as read from the file, before placement.
@@ -97,6 +87,8 @@ struct StepCamApp {
     last_stock_top: Option<f64>,
     /// Part bottom seen last frame (rough ops ending there follow the part).
     last_part_bottom: Option<f64>,
+    /// Part top seen last frame (finish ops starting there follow the part).
+    last_part_top: Option<f64>,
     step_gcode: String,
     step_errors: Vec<String>,
     step_generated_from: Option<(StepJob, Settings)>,
@@ -115,35 +107,24 @@ struct StepCamApp {
 
 impl Default for StepCamApp {
     fn default() -> Self {
-        let mut job = Job::default();
-        job.groups.push(ThreadGroup {
-            locations: "10, 10\n20, 10\n".into(),
-            ..Default::default()
-        });
         StepCamApp {
-            job,
+            job: Job::default(),
             tab: Tab::StepMilling,
-            gcode: String::new(),
-            gen_errors: Vec::new(),
-            gcode_time: 0.0,
             step_gcode_time: 0.0,
-            generated_from: None,
-            toolpath: Default::default(),
-            view: Default::default(),
             status: String::new(),
             status_is_error: false,
             job_path: "job.stepcam.json".into(),
-            gcode_path: "output.nc".into(),
             step_raw: None,
             step_model: None,
             set_z_value: 0.0,
             last_stock_top: None,
             last_part_bottom: None,
+            last_part_top: None,
             step_gcode: String::new(),
             step_errors: Vec::new(),
             step_generated_from: None,
             step_toolpath: Default::default(),
-            step_view: view3d::View3d::with_labels(["Milling", ""]),
+            step_view: view3d::View3d::default(),
             step_gcode_path: "step.nc".into(),
             sel: Selection::default(),
             menu_pick: None,
@@ -155,47 +136,12 @@ impl Default for StepCamApp {
     }
 }
 
-enum RowAction {
-    Remove(usize),
-    Duplicate(usize),
-    MoveUp(usize),
-    MoveDown(usize),
-}
-
 impl StepCamApp {
     fn set_status(&mut self, msg: impl Into<String>, error: bool) {
         self.status = msg.into();
         self.status_is_error = error;
     }
 
-    /// Regenerate the G-code and toolpath if the job changed since last time.
-    fn regenerate_if_changed(&mut self) {
-        if self.generated_from.as_ref() == Some(&self.job) {
-            return;
-        }
-        let was_empty = self.toolpath.is_empty();
-        match gcode::generate(&self.job) {
-            Ok(code) => {
-                self.toolpath = toolpath::parse(&code);
-                let s = &self.job.settings;
-                self.gcode_time = estimate::estimate(&code, s.rapid_rate, s.max_accel);
-                self.gcode = code;
-                self.gen_errors.clear();
-            }
-            Err(errs) => {
-                self.gcode.clear();
-                self.toolpath = Default::default();
-                self.gen_errors = errs;
-            }
-        }
-        if was_empty && !self.toolpath.is_empty() {
-            self.view.needs_fit = true;
-        }
-        self.generated_from = Some(self.job.clone());
-    }
-
-    /// Regenerate the step milling program if its operations or settings changed.
-    /// Stock box for the current model.
     fn stock_box(&self) -> Option<([f64; 3], [f64; 3])> {
         self.step_model.as_ref().map(|m| self.job.step.stock.bounds(m.min, m.max))
     }
@@ -208,13 +154,14 @@ impl StepCamApp {
         let region = [smin[0], smin[1], smax[0], smax[1]];
         let model = self.step_model.as_ref().unwrap();
         let part_bottom = model.min[2];
-        if self.rough_cache.is_none() && self.job.step.ops.iter().any(|o| matches!(o.kind, OpKind::Rough(_))) {
+        let part_top = model.max[2];
+        if self.rough_cache.is_none() && self.job.step.ops.iter().any(|o| matches!(o.kind, OpKind::Rough(_) | OpKind::Finish(_))) {
             self.rough_cache = Some(stepmill::rough_faces(model));
         }
         for op in &mut self.job.step.ops {
             match &mut op.kind {
                 OpKind::Face(f) => f.region = region,
-                OpKind::Rough(r) => {
+                OpKind::Rough(r) | OpKind::Finish(r) => {
                     if r.stock_region != region {
                         r.stock_region = region;
                     }
@@ -231,8 +178,15 @@ impl StepCamApp {
                 }
                 _ => {}
             }
+            // finishing from the part top follows it
+            if let (OpKind::Finish(r), Some(old)) = (&mut op.kind, self.last_part_top) {
+                if (r.start_z - old).abs() < 1e-6 {
+                    r.start_z = part_top;
+                }
+            }
         }
         self.last_part_bottom = Some(part_bottom);
+        self.last_part_top = Some(part_top);
         if let Some(old) = self.last_stock_top {
             if (old - smax[2]).abs() > 1e-9 {
                 for op in &mut self.job.step.ops {
@@ -241,7 +195,7 @@ impl StepCamApp {
                         OpKind::Pocket(p) => &mut p.start_z,
                         OpKind::Profile(p) => &mut p.start_z,
                         OpKind::Rough(r) => &mut r.start_z,
-                        OpKind::Tab(_) | OpKind::Engrave(_) | OpKind::Thread(_) => continue,
+                        OpKind::Finish(_) | OpKind::Tab(_) | OpKind::Engrave(_) | OpKind::Thread(_) => continue,
                     };
                     if (*start - old).abs() < 1e-6 {
                         *start = smax[2];
@@ -266,7 +220,7 @@ impl StepCamApp {
                     OpKind::Face(f) => Some(f.start_z),
                     OpKind::Pocket(p) => Some(p.start_z),
                     OpKind::Profile(p) => Some(p.start_z),
-                    OpKind::Rough(r) => Some(r.start_z),
+                    OpKind::Rough(r) | OpKind::Finish(r) => Some(r.start_z),
                     OpKind::Tab(t) => Some(t.top()),
                     OpKind::Engrave(g) => Some(g.z),
                     OpKind::Thread(t) => Some(t.group.start_z),
@@ -283,11 +237,12 @@ impl StepCamApp {
         s
     }
 
-    fn regenerate_step_if_changed(&mut self) {
+    /// Regenerate the program if the job changed; true if it did.
+    fn regenerate_step_if_changed(&mut self) -> bool {
         self.sync_stock();
         let settings = self.step_settings();
         if self.step_generated_from.as_ref().map_or(false, |(j, s)| j == &self.job.step && s == &settings) {
-            return;
+            return false;
         }
         let was_empty = self.step_toolpath.is_empty();
         match stepmill::generate(&self.job.step, &settings) {
@@ -310,21 +265,12 @@ impl StepCamApp {
             self.step_view.needs_fit = true;
         }
         self.step_generated_from = Some((self.job.step.clone(), settings));
-    }
-
-    /// The tab works with the step milling program (else thread milling).
-    fn is_step_tab(&self) -> bool {
-        self.tab == Tab::StepMilling || (self.tab == Tab::Simulator && self.sim.source != simview::Source::Thread)
+        true
     }
 
     fn save_gcode(&mut self) {
-        let (code, errors, path) = if self.is_step_tab() {
-            self.regenerate_step_if_changed();
-            (&self.step_gcode, &self.step_errors, self.step_gcode_path.clone())
-        } else {
-            self.regenerate_if_changed();
-            (&self.gcode, &self.gen_errors, self.gcode_path.clone())
-        };
+        self.regenerate_step_if_changed();
+        let (code, errors, path) = (&self.step_gcode, &self.step_errors, self.step_gcode_path.clone());
         if !errors.is_empty() {
             self.set_status("Cannot save G-code: fix the errors listed above", true);
             return;
@@ -452,9 +398,12 @@ impl StepCamApp {
         match res {
             Ok(mut job) => {
                 job.normalize();
+                let moved = migrate_thread_groups(&mut job);
                 self.job = job;
-                self.view.needs_fit = true;
                 self.set_status(format!("Loaded job from {}", self.job_path), false);
+                if moved > 0 {
+                    self.status += &format!(" ({moved} thread milling group(s) from the old Thread Milling tab are now thread items in the operations list)");
+                }
                 self.step_model = None;
                 self.step_raw = None;
                 self.rough_cache = None;
@@ -482,14 +431,12 @@ impl StepCamApp {
             }
             ui.separator();
             ui.label("G-code file:");
-            let path = if self.is_step_tab() { &mut self.step_gcode_path } else { &mut self.gcode_path };
-            ui.add(egui::TextEdit::singleline(path).desired_width(220.0));
+            ui.add(egui::TextEdit::singleline(&mut self.step_gcode_path).desired_width(220.0));
             if ui.button("💾 Save G-code").clicked() {
                 self.save_gcode();
             }
         });
-        let (code, errors, secs) =
-            if self.is_step_tab() { (&self.step_gcode, &self.step_errors, self.step_gcode_time) } else { (&self.gcode, &self.gen_errors, self.gcode_time) };
+        let (code, errors, secs) = (&self.step_gcode, &self.step_errors, self.step_gcode_time);
         if errors.is_empty() {
             ui.horizontal(|ui| {
                 ui.label(format!("G-code: {} lines (updates automatically)", code.lines().count()));
@@ -510,209 +457,6 @@ impl StepCamApp {
                 ui.visuals().text_color()
             };
             ui.colored_label(color, &self.status);
-        }
-    }
-
-    fn thread_milling_tab(&mut self, ui: &mut egui::Ui) {
-        // 3D view of the generated program, docked at the bottom of the tab
-        let holes: Vec<view3d::HoleViz> = self
-            .job
-            .groups
-            .iter()
-            .flat_map(|g| {
-                let locs = g.parse_locations().unwrap_or_default();
-                let (dia, top, bottom) = (g.thread.hole_dia() as f32, g.start_z as f32, (g.start_z - g.hole_depth()) as f32);
-                locs.into_iter().map(move |(x, y)| view3d::HoleViz { x: x as f32, y: y as f32, dia, top, bottom })
-            })
-            .collect();
-        egui::TopBottomPanel::bottom("view3d_panel")
-            .resizable(true)
-            .default_height(420.0)
-            .min_height(150.0)
-            .show_inside(ui, |ui| {
-                ui.add_space(4.0);
-                self.view.ui(ui, &self.toolpath, &holes, None);
-            });
-
-        ui.horizontal(|ui| {
-            ui.heading("Thread Locations");
-            if ui.button("➕ Add group").clicked() {
-                // new groups copy the previous group's start Z, and use the global down angle
-                let start_z = self.job.groups.last().map(|g| g.start_z).unwrap_or(0.0);
-                let thread = ThreadGroup::default().thread;
-                self.job.groups.push(ThreadGroup {
-                    start_z,
-                    ramp_angle: self.job.settings.ramp_angle,
-                    cutter: Cutter::default_for(&self.job.settings.cutters, thread),
-                    ..Default::default()
-                });
-            }
-        });
-        ui.horizontal(|ui| {
-            let s = &mut self.job.settings;
-            ui.label("Spindle speed");
-            ui.add(egui::DragValue::new(&mut s.spindle_rpm).range(1.0..=100000.0).speed(10.0).max_decimals(0).suffix(" rpm"))
-                .on_hover_text("Spindle speed for milling and threading");
-            ui.add_space(12.0);
-            ui.label("Rapid plane Z");
-            ui.add(egui::DragValue::new(&mut s.safe_z).speed(0.1).max_decimals(3).suffix(" mm"))
-                .on_hover_text("Thread milling: absolute Z for rapids between groups and tool changes (step milling sets its own above the stock)");
-            ui.add_space(12.0);
-            ui.label("Milling feed");
-            ui.add(egui::DragValue::new(&mut s.bore_feed).range(1.0..=100000.0).speed(1.0).max_decimals(1).suffix(" mm/min"))
-                .on_hover_text("Helical boring feed at the cutter centre");
-            ui.add_space(12.0);
-            ui.label("Threading feed");
-            ui.add(egui::DragValue::new(&mut s.thread_feed).range(1.0..=100000.0).speed(1.0).max_decimals(1).suffix(" mm/min"))
-                .on_hover_text("Thread milling feed at the cutting edge (centre feed is reduced automatically)");
-            ui.add_space(12.0);
-            ui.label("Milling down angle");
-            ui.add(egui::DragValue::new(&mut s.ramp_angle).range(0.1..=45.0).speed(0.1).max_decimals(2).suffix("°"))
-                .on_hover_text("Default helical descent angle for new groups");
-            if ui.button("Apply to all groups").on_hover_text("Set every group's descent angle to this value").clicked() {
-                let a = s.ramp_angle;
-                for g in &mut self.job.groups {
-                    g.ramp_angle = a;
-                }
-            }
-        });
-        ui.label(
-            "One location per line as \"x, y\" (also accepts \"X10 Y20\"). Hole depth = thread length + 1 pitch; \
-             the thread is milled bottom-up and stops one pitch above the bottom of the hole.",
-        );
-        ui.add_space(4.0);
-
-        let settings = self.job.settings.clone();
-        let mut action = None;
-
-        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-            egui::Grid::new("thread_groups")
-                .striped(true)
-                .num_columns(10)
-                .spacing([12.0, 8.0])
-                .min_row_height(24.0)
-                .show(ui, |ui| {
-                    for h in ["Group", "Thread", "Hole start Z", "Thread length", "Descent angle", "Milling cutter", "Locations (x, y)", "Hole", "Status", ""] {
-                        ui.strong(h);
-                    }
-                    ui.end_row();
-
-                    let n = self.job.groups.len();
-                    for (i, g) in self.job.groups.iter_mut().enumerate() {
-                        ui.label(format!("{}", i + 1));
-
-                        // thread size
-                        let before = g.thread;
-                        egui::ComboBox::from_id_salt(("thread", i))
-                            .selected_text(g.thread.name())
-                            .width(70.0)
-                            .show_ui(ui, |ui| {
-                                for t in ThreadSize::ALL {
-                                    ui.selectable_value(&mut g.thread, t, t.name());
-                                }
-                            });
-                        if g.thread != before && !g.cutter.fits(g.thread) {
-                            g.cutter = Cutter::default_for(&settings.cutters, g.thread);
-                        }
-
-                        // hole start Z
-                        ui.add(egui::DragValue::new(&mut g.start_z).speed(0.1).max_decimals(3).suffix(" mm"))
-                            .on_hover_text("All hole geometry is below this Z");
-
-                        // thread length
-                        ui.add(
-                            egui::DragValue::new(&mut g.length)
-                                .range(0.0..=100.0)
-                                .speed(0.1)
-                                .max_decimals(3)
-                                .suffix(" mm"),
-                        );
-
-                        // descent angle for the helical milling op
-                        ui.add(egui::DragValue::new(&mut g.ramp_angle).range(0.1..=45.0).speed(0.1).max_decimals(2).suffix("°"))
-                            .on_hover_text("Helical descent angle for hole milling");
-
-                        // cutter - only cutters smaller than the hole are selectable
-                        egui::ComboBox::from_id_salt(("cutter", i))
-                            .selected_text(format!("T{} {}", g.cutter.tool, g.cutter.name()))
-                            .width(90.0)
-                            .show_ui(ui, |ui| {
-                                for &c in &settings.cutters {
-                                    let ok = c.fits(g.thread);
-                                    ui.add_enabled_ui(ok, |ui| {
-                                        ui.selectable_value(&mut g.cutter, c, format!("T{} {}", c.tool, c.name()))
-                                            .on_disabled_hover_text("cutter must be smaller than the hole diameter");
-                                    });
-                                }
-                            });
-
-                        // locations
-                        ui.add(
-                            egui::TextEdit::multiline(&mut g.locations)
-                                .desired_rows(3)
-                                .desired_width(150.0)
-                                .code_editor()
-                                .hint_text("x, y"),
-                        );
-
-                        // info
-                        let count = g.parse_locations().map(|v| v.len()).unwrap_or(0);
-                        ui.label(format!(
-                            "Ø{} × {} deep\nbottom Z{}\npitch {}\n{} hole(s)",
-                            gcode::fmt(g.thread.hole_dia()),
-                            gcode::fmt(g.hole_depth()),
-                            gcode::fmt(g.start_z - g.hole_depth()),
-                            gcode::fmt(g.thread.pitch()),
-                            count
-                        ));
-
-                        // validation
-                        let issues = gcode::validate_group(g, &settings);
-                        ui.vertical(|ui| {
-                            if issues.is_empty() {
-                                ui.colored_label(egui::Color32::from_rgb(60, 170, 80), "✔ OK");
-                            }
-                            for is in &issues {
-                                let col = if is.error {
-                                    ui.visuals().error_fg_color
-                                } else {
-                                    ui.visuals().warn_fg_color
-                                };
-                                ui.colored_label(col, format!("{} {}", if is.error { "✖" } else { "⚠" }, is.msg));
-                            }
-                        });
-
-                        ui.horizontal(|ui| {
-                            if ui.add_enabled(i > 0, egui::Button::new("⬆")).on_hover_text("Move up").clicked() {
-                                action = Some(RowAction::MoveUp(i));
-                            }
-                            if ui.add_enabled(i + 1 < n, egui::Button::new("⬇")).on_hover_text("Move down").clicked() {
-                                action = Some(RowAction::MoveDown(i));
-                            }
-                            if ui.button("⧉").on_hover_text("Duplicate").clicked() {
-                                action = Some(RowAction::Duplicate(i));
-                            }
-                            if ui.button("🗑").on_hover_text("Remove").clicked() {
-                                action = Some(RowAction::Remove(i));
-                            }
-                        });
-                        ui.end_row();
-                    }
-                });
-        });
-
-        let groups = &mut self.job.groups;
-        match action {
-            Some(RowAction::Remove(i)) => {
-                groups.remove(i);
-            }
-            Some(RowAction::Duplicate(i)) => {
-                let g = groups[i].clone();
-                groups.insert(i + 1, g);
-            }
-            Some(RowAction::MoveUp(i)) => groups.swap(i, i - 1),
-            Some(RowAction::MoveDown(i)) => groups.swap(i, i + 1),
-            None => {}
         }
     }
 
@@ -759,12 +503,12 @@ impl StepCamApp {
             .filter_map(|o| if let OpKind::Tab(t) = &o.kind { Some(t.clone()) } else { None })
             .collect();
         let Some(model) = self.step_model.take() else {
-            self.step_view.ui(ui, &self.step_toolpath, &[], None);
+            self.step_view.ui(ui, &self.step_toolpath, None);
             return;
         };
         let stock = self.job.step.stock.bounds(model.min, model.max);
         let viz = ModelViz { model: &model, sel_edges: &self.sel.edges, sel_faces: &self.sel.faces, tabs: &tabs, stock: Some(stock), origin: Some(self.job.step.origin.at) };
-        let out = self.step_view.ui(ui, &self.step_toolpath, &[], Some(&viz));
+        let out = self.step_view.ui(ui, &self.step_toolpath, Some(&viz));
         // Ctrl / Cmd + click adds cylindrical holes to the selection (or
         // removes them); right-clicking a selected hole keeps the selection
         let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
@@ -848,6 +592,13 @@ impl StepCamApp {
         // roughing goes before the other cutting ops
         let at = rough_insert_at(&self.job.step.ops);
         self.job.step.ops.insert(at, StepOp { enabled: true, kind: OpKind::Rough(op) });
+    }
+
+    fn add_finish_op(&mut self) {
+        let (Some(model), Some(stock)) = (&self.step_model, self.stock_box()) else { return };
+        let op = finish_op(model, stock, &self.job.settings);
+        let at = finish_insert_at(&self.job.step.ops);
+        self.job.step.ops.insert(at, StepOp { enabled: true, kind: OpKind::Finish(op) });
     }
 
     fn stock_row(&mut self, ui: &mut egui::Ui) {
@@ -956,6 +707,14 @@ impl StepCamApp {
             {
                 self.add_rough_op();
             }
+            if ui
+                .add_enabled(have_model, egui::Button::new("➕ Finish"))
+                .on_hover_text("Finish the part's walls after roughing: a lap round every wall at each fine Z step (default 0.1 mm), nothing else")
+                .on_disabled_hover_text("Import a STEP model first")
+                .clicked()
+            {
+                self.add_finish_op();
+            }
         });
         let s = self.step_settings();
         let ops = &mut self.job.step.ops;
@@ -969,6 +728,7 @@ impl StepCamApp {
             .filter_map(|o| if let OpKind::Tab(t) = &o.kind { Some(t.top()) } else { None })
             .fold(f64::NEG_INFINITY, f64::max);
         let n = ops.len();
+        let finish_warn = stepmill::finish_warnings(ops);
         let mut action = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (i, op) in ops.iter_mut().enumerate() {
@@ -996,6 +756,9 @@ impl StepCamApp {
                         if op.enabled {
                             for e in stepmill::validate(op, &s, tabs_top) {
                                 ui.colored_label(ui.visuals().error_fg_color, format!("✖ {e}"));
+                            }
+                            for (_, w) in finish_warn.iter().filter(|(k, _)| *k == i) {
+                                ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {w}"));
                             }
                         }
                     });
@@ -1053,6 +816,11 @@ impl StepCamApp {
                     ui.add(egui::DragValue::new(v).speed(speed).max_decimals(3).suffix(suffix));
                     ui.end_row();
                 }
+                // thread milling items (bore + thread)
+                row(ui, "Thread milling: spindle speed", &mut s.spindle_rpm, 10.0, " rpm");
+                row(ui, "Thread milling: boring feed (cutter centre)", &mut s.bore_feed, 1.0, " mm/min");
+                row(ui, "Thread milling: threading feed (cutting edge)", &mut s.thread_feed, 1.0, " mm/min");
+                row(ui, "Thread milling: default descent angle", &mut s.ramp_angle, 0.1, "°");
                 row(ui, "Clearance above hole start Z (between holes)", &mut s.clearance, 0.1, " mm");
                 row(ui, "Plunge feed", &mut s.plunge_feed, 1.0, " mm/min");
                 row(ui, "Boring ring stepover (% of cutter Ø)", &mut s.bore_stepover_pct, 0.5, " %");
@@ -1193,11 +961,9 @@ impl StepCamApp {
 impl eframe::App for StepCamApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.job.sync_cutters();
-        self.regenerate_if_changed();
         self.regenerate_step_if_changed();
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.sel = Selection::default();
-            self.view.highlight_line = None;
             self.step_view.highlight_line = None;
         }
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -1205,14 +971,12 @@ impl eframe::App for StepCamApp {
             ui.horizontal(|ui| {
                 ui.heading("stepCAM");
                 ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::ThreadMilling, "Thread Milling");
                 ui.selectable_value(&mut self.tab, Tab::StepMilling, "Step Milling");
                 ui.selectable_value(&mut self.tab, Tab::Simulator, "Simulator");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Tools & Settings");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("❓ Help").on_hover_text("User guide for this tab (F1)").clicked() {
                         self.help.open_at(match self.tab {
-                            Tab::ThreadMilling => "Thread Milling tab",
                             Tab::StepMilling => "Step Milling tab",
                             Tab::Simulator => "Simulator tab",
                             Tab::Settings => "Tools & Settings tab",
@@ -1233,8 +997,7 @@ impl eframe::App for StepCamApp {
                     self.sim.code_panel(ui);
                     return;
                 }
-                let step = self.tab == Tab::StepMilling;
-                let (code, view) = if step { (&self.step_gcode, &mut self.step_view) } else { (&self.gcode, &mut self.view) };
+                let (code, view) = (&self.step_gcode, &mut self.step_view);
                 ui.horizontal(|ui| {
                     ui.heading("G-code");
                     if ui.add_enabled(!code.is_empty(), egui::Button::new("📋 Copy")).clicked() {
@@ -1247,7 +1010,7 @@ impl eframe::App for StepCamApp {
                 });
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                     let out = egui::TextEdit::multiline(&mut code.as_str())
-                        .id_source(if step { "step_gcode_text" } else { "gcode_text" })
+                        .id_source("step_gcode_text")
                         .code_editor()
                         .desired_width(f32::INFINITY)
                         .show(ui);
@@ -1261,25 +1024,27 @@ impl eframe::App for StepCamApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::ThreadMilling => self.thread_milling_tab(ui),
             Tab::StepMilling => self.step_milling_tab(ui),
             Tab::Simulator => {
                 let step_stock = self.stock_box();
-                let thread_top = self.job.groups.iter().map(|g| g.start_z).reduce(f64::max);
                 let inp = simview::Inputs {
                     step_code: if self.step_errors.is_empty() { &self.step_gcode } else { "" },
-                    thread_code: if self.gen_errors.is_empty() { &self.gcode } else { "" },
                     settings: &self.job.settings,
                     model: self.step_model.as_ref(),
                     step_stock,
                     step_origin: self.job.step.origin.at,
-                    thread_top,
                 };
                 self.sim.ui(ui, &inp);
             }
             Tab::Settings => self.settings_tab(ui),
         });
         self.help.show(ctx);
+        // edits made this frame (a digit typed into a value box changes the
+        // job straight away, with no further input to wake the next frame):
+        // regenerate now and draw again so the toolpath follows at once
+        if self.regenerate_step_if_changed() {
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -1291,6 +1056,17 @@ enum MenuAction {
     SetOrigin(Option<f64>, Option<f64>, Option<f64>),
     /// Program zero presets.
     OriginModes(Option<OriginXY>, Option<OriginZ>),
+}
+
+/// Jobs saved with the old Thread Milling tab: its groups become thread
+/// milling items in the step milling operations list (with their typed
+/// locations). Returns how many were moved.
+fn migrate_thread_groups(job: &mut Job) -> usize {
+    let n = job.groups.len();
+    for g in job.groups.drain(..) {
+        job.step.ops.push(StepOp { enabled: true, kind: OpKind::Thread(stepmill::ThreadOp { faces: vec![], group: g }) });
+    }
+    n
 }
 
 /// XY outline and top Z of an edge chain; None if the chain is not level.
@@ -1590,7 +1366,9 @@ fn refresh_ops(ops: &mut [StepOp], model: &step::Model, old: &step::Placement, n
                 }
                 None => ok = false,
             },
-            OpKind::Rough(_) => {} // re-synced from the model every frame
+            OpKind::Rough(_) | OpKind::Finish(_) => {} // re-synced from the model every frame
+            // typed locations (no model holes): left as they are
+            OpKind::Thread(t) if t.faces.is_empty() => {}
             OpKind::Thread(t) => {
                 // locations follow the holes; start Z moves with them
                 let holes = holes_of(model, &t.faces);
@@ -1749,6 +1527,20 @@ fn rough_op(model: &step::Model, stock: ([f64; 3], [f64; 3]), settings: &Setting
         }
     }
     op
+}
+
+/// Finishing of the part's walls from the part top down, in fine steps.
+fn finish_op(model: &step::Model, stock: ([f64; 3], [f64; 3]), settings: &Settings) -> RoughOp {
+    let mut op = rough_op(model, stock, settings);
+    op.start_z = model.max[2];
+    op.layer_height = stepmill::FINISH_STEP;
+    op.allowance = 0.0;
+    op
+}
+
+/// Where a new finishing op goes: after the last roughing / finishing op.
+fn finish_insert_at(ops: &[StepOp]) -> usize {
+    ops.iter().rposition(|o| matches!(o.kind, OpKind::Rough(_) | OpKind::Finish(_))).map_or_else(|| rough_insert_at(ops), |k| k + 1)
 }
 
 /// Where a new roughing op goes: before the other cutting ops.
@@ -2127,6 +1919,18 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
             ui.label(format!("{} {} at Z{}", p.edges.len(), if p.closed { "(closed loop)" } else { "(open chain)" }, gcode::fmt(p.edge_z)));
             ui.end_row();
         }
+        OpKind::Finish(r) => {
+            cutter_combo(ui, i, &mut r.cutter, cutters);
+            num(ui, "Z step", &mut r.layer_height, 0.01, " mm", "Height between laps (extra laps at every flat floor and at the top and foot of every slope)");
+            num(ui, "Stock to leave", &mut r.allowance, 0.01, " mm", "Left on the walls (0 = cut to size)");
+            num(ui, "Feed", &mut r.feed, 1.0, " mm/min", "");
+            num(ui, "Speed", &mut r.speed, 10.0, " rpm", "");
+            num(ui, "Start Z", &mut r.start_z, 0.1, " mm", "First lap just below this (default: the part top)");
+            num(ui, "Bottom Z", &mut r.bottom_z, 0.1, " mm", "Last lap (default: the part bottom)");
+            ui.label("Layers");
+            ui.label(format!("{}", stepmill::rough_levels(r).len()));
+            ui.end_row();
+        }
         OpKind::Rough(r) => {
             cutter_combo(ui, i, &mut r.cutter, cutters);
             ui.label("Strategy");
@@ -2156,6 +1960,12 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
             ui.label("Clear voids");
             ui.checkbox(&mut r.clear_voids, "")
                 .on_hover_text("Pockets and steps (anything with a face below) are always cleared.\nTicked: holes that go right through the part are cleared too.\nUnticked: through holes are only profiled.");
+            ui.end_row();
+            ui.label("Finish each layer");
+            ui.checkbox(&mut r.finish_layers, "").on_hover_text(
+                "After clearing each layer, a climb-milled contour pass round the part's walls at tool radius + stock to leave \
+                 (cleans up the scallops adaptive clearing leaves). Unticked: clearing only.",
+            );
             ui.end_row();
             num(ui, "Layer height", &mut r.layer_height, 0.05, " mm", "Depth of each roughing layer (extra layers are added at every flat floor)");
             num(ui, "Stepover", &mut r.stepover_pct, 0.5, " %", "% of cutter diameter");
@@ -2616,5 +2426,53 @@ mod origin_pick_tests {
         assert_eq!(app.job.step.origin.at[0], 1.5);
         app.menu_action(MenuAction::OriginModes(Some(OriginXY::Center), None));
         assert_eq!(app.job.step.origin.at[0], (lo[0] + hi[0]) / 2.0);
+    }
+}
+
+#[cfg(test)]
+mod migrate_tests {
+    use super::*;
+
+    #[test]
+    fn old_thread_groups_become_thread_items_that_generate() {
+        let old = r#"{"groups": [{"thread": "M4", "start_z": 0.0, "ramp_angle": 3.0, "length": 6.0,
+            "cutter": {"id": 3, "tool": 3, "dia": 2.0, "flute": 12.0}, "locations": "10, 10\n20, 10\n"}]}"#;
+        let mut job: Job = serde_json::from_str(old).unwrap();
+        job.normalize();
+        assert_eq!(migrate_thread_groups(&mut job), 1);
+        assert!(job.groups.is_empty());
+        let OpKind::Thread(t) = &job.step.ops[0].kind else { panic!() };
+        assert_eq!(t.group.parse_locations().unwrap(), vec![(10.0, 10.0), (20.0, 10.0)]);
+        let s = Settings { safe_z: 10.0, ..job.settings.clone() };
+        let code = stepmill::generate(&job.step, &s).unwrap();
+        assert!(code.contains("T3 M6") && code.contains("T14 M6"), "{code}");
+        // a model move leaves typed locations alone
+        let m = step::parse_model(include_str!("../testdata/pocket_block.step")).unwrap();
+        let p = step::Placement::default().translated([0.0, 0.0, 5.0]);
+        let warn = refresh_ops(&mut job.step.ops, &m.transformed(&p), &step::Placement::default(), &p);
+        assert!(warn.is_empty() && job.step.ops[0].enabled, "{warn:?}");
+    }
+}
+
+#[cfg(test)]
+mod regen_tests {
+    use super::*;
+
+    #[test]
+    fn regenerating_reports_changes_so_the_frame_redraws() {
+        let mut app = StepCamApp::default();
+        let m = step::parse_model(include_str!("../testdata/pocket_block.step")).unwrap();
+        app.step_model = Some(m.clone());
+        app.step_raw = Some(m);
+        app.add_rough_op();
+        assert!(app.regenerate_step_if_changed());
+        assert!(!app.regenerate_step_if_changed(), "nothing changed");
+        let before = app.step_gcode.clone();
+        // what typing a digit into the Stepover box does mid-frame
+        if let OpKind::Rough(r) = &mut app.job.step.ops[0].kind {
+            r.stepover_pct = 25.0;
+        }
+        assert!(app.regenerate_step_if_changed());
+        assert_ne!(app.step_gcode, before);
     }
 }

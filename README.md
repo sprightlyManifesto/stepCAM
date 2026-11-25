@@ -1,6 +1,6 @@
 # stepCAM
 
-Generates G-code to helically bore holes and then thread-mill them (M2–M6).
+Generates G-code for a 3-axis mill from STEP models: facing, pocketing, profiling, roughing, engraving, and helical boring + thread milling of M2–M6 holes, with a simulator.
 
     cargo run --release
 
@@ -8,15 +8,14 @@ Generates G-code to helically bore holes and then thread-mill them (M2–M6).
 
 The user guide is [docs/user-guide.md](docs/user-guide.md). It is also built into the app: click **❓ Help** (top right) or press **F1** to open it at the section for the current tab, with a contents list and search.
 
-- **Thread Milling** tab: the *Thread Locations* table. Each group has a list of x,y locations,
-  a thread size, a thread length (0–100 mm) and a hole-milling cutter.
-- **Tools & Settings** tab: Z heights, feeds/speeds, and the editable tool tables (end mills and the thread mill for each size). **Save settings… / Load settings…** store all of it as a JSON file.
+- **Tools & Settings** tab: Z heights, feeds/speeds (including the thread milling spindle speed, boring and threading feeds), and the editable tool tables (end mills and the thread mill for each size). **Save settings… / Load settings…** store all of it as a JSON file.
 - **Fewer non-cutting moves** within each operation: holes are bored nearest-next and threaded in reverse (starting where boring ended), engraving goes to the nearest letter outline next and enters it at its nearest point, profiles and pockets start near where the tool is, and roughing cuts each layer's regions and outlines nearest-first. Roughing hops between cuts stay low (0.5 mm above the layer above) when they only pass over ground cleared on the layer above, instead of going up to the retract height.
 - **Estimated run time** is shown next to the G-code line count. Every move speeds up and slows down at the **max acceleration** (default 200 mm/s²) up to its feed, or the **rapid rate** (default 3000 mm/min) for G0; both are set on the Tools & Settings tab. Corners slow down as on a typical controller (junction deviation 0.01 mm), so smooth paths keep their speed. Tool changes and spindle spin-up are not counted.
 - Hole depth = thread length + 1 pitch. Threads are milled bottom-up (G03, climb) from
   Z = top − length, so they stop one pitch above the bottom of the hole.
-- Tools (defaults, all editable): cutters T1–T5 (1x3, 1.5x6, 2x12, 3x17, 3.175x17), thread mills T11–T16 (M2…M6), engraving bits T21–T23 (tapered: 30° / 60° / 90° included angle with a 0.1 / 0.2 / 0.3 mm tip flat, each with a max depth). Add, remove and renumber end mills or change their Ø / flute length; groups and operations using a tool follow the edit. Tool numbers must be unique across both tables.
-- All boring runs first, then all threading, so there are as few tool changes as possible.
+- Tools (defaults, all editable): cutters T1–T5 (1x3, 1.5x6, 2x12, 3x17, 3.175x17), thread mills T11–T16 (M2…M6), engraving bits T21–T23 (tapered: 30° / 60° / 90° included angle with a 0.1 / 0.2 / 0.3 mm tip flat, each with a max depth). Add, remove and renumber end mills or change their Ø / flute length; operations using a tool follow the edit. Tool numbers must be unique across both tables.
+- Each thread milling item bores all its holes first, then threads them.
+- Jobs saved with the old Thread Milling tab still load: their thread groups become thread milling items in the operations list, with their typed locations.
 
 ## Step Milling tab
 
@@ -38,8 +37,8 @@ The user guide is [docs/user-guide.md](docs/user-guide.md). It is also built int
     no milling operations. Curved surfaces can be picked (for highlighting) but have no surface operations; Rough follows them.
   - cylindrical hole → **Add to thread milling**: **Ctrl+click** (Cmd on macOS) holes to select
     several (Ctrl+click a selected hole to drop it), then right-click one of them. This adds a
-    thread milling item to the list with the same fields as a group on the Thread Milling tab
-    (thread, hole start Z, thread length, descent angle, milling cutter, locations), bored and
+    thread milling item to the list (thread, hole start Z, thread length, descent angle,
+    milling cutter, locations), bored and
     thread milled in the step program. Locations come from the hole centres, start Z from the top
     of the hole, the size from the closest tap-drill or major Ø (M2–M6, within 0.3 mm; a tap-drill
     match wins, so Ø5 is M6), and the length from the modelled depth (blind holes: depth − 1 pitch,
@@ -75,7 +74,7 @@ Plays a program against the stock and shows the material being cut away.
   - ⏮ ⏪ ▶/⏸ ⏩ ⏭ (Home, ←, Space, →, End): start, previous move, play/pause, next move, end.
   - The time slider scrubs, and **Speed** runs from 0.1× to 2000× machine time. Machine time comes from the run-time estimate, so the clock matches it.
   - Jumping back restores a saved snapshot instead of re-cutting from the start.
-- **3D view:** shaded stock (uncut stock tan, cut surfaces bright, cut-through floor dark), the tool with its flutes and shank, and the path. **Path: All** shows what is still to come faintly, **Done** shows only the path cut so far.
+- **3D view:** shaded stock (uncut stock tan, cut surfaces bright, cut-through floor dark), the tool with its flutes and shank, and the path. **Path: All** shows what is still to come faintly, **Done** shows only the path cut so far. **Rapids / Milling / Threading** checkboxes show or hide each kind of move.
 - **G-code panel:** follows playback (**Follow**). Clicking a line runs the simulation to the end of that line's move.
 - **Machine panel:** time, line, tool, rapid / feed, X Y Z and material removed.
 - **Compare with model** (step milling):
@@ -168,8 +167,14 @@ Every X / Y / Z in the step milling G-code is written relative to the origin dir
 Step milling sets its own rapid plane: **Rapid plane height above stock or
 part** (default 10 mm) is added to the highest point of the stock or the part,
 whichever is higher, and the resulting Z is shown next to the input. It
-follows stock and model changes automatically. The *Rapid plane Z* on the
-Thread Milling tab only applies to thread milling.
+follows stock and model changes automatically.
+
+## Finishing (Step Milling)
+
+**➕ Finish** (next to ➕ Rough) adds wall finishing after roughing:
+- **Laps:** at every Z step (default 0.1 mm, plus every flat floor and the top and foot of every slope), from the part top down to the part bottom, one climb-milled lap round each part wall at tool radius + stock to leave (default 0). Nothing else is cut.
+- **Links:** laps of the same wall on consecutive layers join with a short feed. Other moves retract, then come down to one roughing layer above the lap.
+- **Warning:** a Finish with no enabled Rough before it in the list shows a warning, which batch mode and the Python `job.finish()` also report.
 
 ## Roughing (Step Milling)
 
@@ -207,6 +212,9 @@ works layer by layer from the stock top (Start Z) down to the part bottom
   Profile finishing ops.
 * Strategy (standard / adaptive), entry (helix / zigzag / plunge), stepover,
   feed, speed and ramp angle work as for pockets. Climb milled.
+  * With **adaptive**, the band round the outside profile (and the stock facing) is widened by the trochoid loops' diameter (0.8 × tool Ø), so the outside profile is cut with loops rather than slotted.
+  * Whatever the loops leave between them (middles of wide areas, corners) is cleared with standard passes.
+* **Finish each layer** (default on): a contour pass round the part's walls after each layer is cleared (not the band's outer limit). Untick it to clear only.
 
 The part is seen from above: flat up-facing surfaces count at their Z,
 sloped or curved surfaces at their highest point (so material is left

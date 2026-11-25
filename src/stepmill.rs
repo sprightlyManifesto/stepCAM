@@ -109,6 +109,13 @@ pub struct PocketOp {
     /// Lowest Z of each island loop (sloped floors: an ignored island is
     /// cleared from the levels at or below its lowest point).
     pub islands_z: Vec<f64>,
+    /// Roughing layers: no contour pass on the walls at all.
+    #[serde(skip)]
+    pub no_contour: bool,
+    /// Roughing layers: the outer boundary is the clearing band's limit, not
+    /// a wall, so the contour pass leaves it out.
+    #[serde(skip)]
+    pub open_outer: bool,
 }
 
 impl Default for PocketOp {
@@ -134,6 +141,8 @@ impl Default for PocketOp {
             finish_pass: true,
             floor: vec![],
             islands_z: vec![],
+            no_contour: false,
+            open_outer: false,
         }
     }
 }
@@ -190,6 +199,9 @@ pub struct RoughOp {
     /// Clear all material inside the part (true) or only profile the holes
     /// that go right through it (false).
     pub clear_voids: bool,
+    /// After clearing each layer, a contour pass round the part's walls at
+    /// tool radius + stock to leave (cleans up adaptive clearing's scallops).
+    pub finish_layers: bool,
     /// Model faces seen from above - kept in sync with the model.
     pub faces: Vec<RoughFace>,
     /// Stock extents in XY (min x, min y, max x, max y) - kept in sync with
@@ -213,6 +225,7 @@ impl Default for RoughOp {
             bottom_z: -1.0,
             overcut_z: 0.0,
             clear_voids: true,
+            finish_layers: true,
             faces: vec![],
             stock_region: [0.0; 4],
         }
@@ -358,12 +371,17 @@ pub enum OpKind {
     Tab(MillTab),
     Profile(ProfileOp),
     Rough(RoughOp),
+    /// Finishing after roughing: laps round the part's walls only, layer by
+    /// layer (fine steps). Uses the roughing fields: layer_height = Z step,
+    /// allowance = stock to leave; stepover / strategy / entry / clear voids /
+    /// overcut are not used.
+    Finish(RoughOp),
     Engrave(EngraveOp),
     Thread(ThreadOp),
 }
 
 /// Thread milling of holes picked on the model: the same bore + thread
-/// cycle (and fields) as a group on the Thread Milling tab.
+/// cycle and fields as the old Thread Milling tab's groups.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThreadOp {
@@ -400,6 +418,7 @@ impl StepOp {
             OpKind::Tab(t) => format!("Mill tab at X{} Y{} Z{}", fmt(t.center[0]), fmt(t.center[1]), fmt(t.center[2])),
             OpKind::Profile(p) => format!("Profile {} to Z{}", p.side.name(), fmt(p.z)),
             OpKind::Rough(r) => format!("Rough to Z{} ({} mm layers)", fmt(r.final_z()), fmt(r.layer_height)),
+            OpKind::Finish(r) => format!("Finish walls to Z{} ({} mm steps)", fmt(r.bottom_z), fmt(r.layer_height)),
             OpKind::Engrave(e) => {
                 let first = e.text.lines().next().unwrap_or("");
                 let short: String = first.chars().take(20).collect();
@@ -426,7 +445,7 @@ impl StepOp {
             OpKind::Face(f) => Some(&mut f.cutter),
             OpKind::Pocket(p) => Some(&mut p.cutter),
             OpKind::Profile(p) => Some(&mut p.cutter),
-            OpKind::Rough(r) => Some(&mut r.cutter),
+            OpKind::Rough(r) | OpKind::Finish(r) => Some(&mut r.cutter),
             OpKind::Engrave(e) => match &mut e.tool {
                 engrave::EngraveTool::EndMill(c) => Some(c),
                 engrave::EngraveTool::Bit(_) => None,
@@ -457,7 +476,7 @@ impl StepOp {
             OpKind::Pocket(p) => &p.edges,
             OpKind::Tab(t) => &t.edges,
             OpKind::Profile(p) => &p.edges,
-            OpKind::Face(_) | OpKind::Rough(_) | OpKind::Engrave(_) | OpKind::Thread(_) => &[],
+            OpKind::Face(_) | OpKind::Rough(_) | OpKind::Finish(_) | OpKind::Engrave(_) | OpKind::Thread(_) => &[],
         }
     }
 }
@@ -915,6 +934,75 @@ fn stations(p: &[P2], s0: f64, s1: f64) -> Vec<f64> {
     mid
 }
 
+/// Points within `w` of a closed loop (either orientation).
+fn ring_around(l: &[P2], w: f64) -> geo::MultiPolygon<f64> {
+    use geo::BooleanOps;
+    let mut l = l.to_vec();
+    if signed_area(&l) < 0.0 {
+        l.reverse();
+    }
+    let ccw = |v: Vec<Vec<P2>>| union_all(v.into_iter().filter(|x| signed_area(x) > 0.0).map(|x| to_geo(&x, &[])));
+    ccw(offset_region(&l, &[], -w)).difference(&ccw(offset_region(&l, &[], w)))
+}
+
+/// Standard loops for what adaptive clearing's trochoidal `loops` (each
+/// cutting `reach` either side of its centre loop) leave of `area` (the
+/// material to clear): a pocket of the tool centres that reach it (the
+/// left-over material grown by the tool radius `r`, kept to where the tool
+/// centre may go, `allowed`), both as offset loops (CCW outers, CW holes).
+/// Offset index from `k0` up (inside out, so they are cut first).
+fn adaptive_cleanup(loops: &[(usize, Vec<P2>, bool)], area: &[Vec<P2>], allowed: &[Vec<P2>], reach: f64, r: f64, step: f64, k0: usize) -> Vec<(usize, Vec<P2>, bool)> {
+    use geo::BooleanOps;
+    let region = |ls: &[Vec<P2>]| {
+        let outers = union_all(ls.iter().filter(|l| signed_area(l) > 0.0).map(|l| to_geo(l, &[])));
+        let holes = union_all(ls.iter().filter(|l| signed_area(l) < 0.0).map(|l| to_geo(&l.iter().rev().copied().collect::<Vec<_>>(), &[])));
+        outers.difference(&holes)
+    };
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let swept = union_tree(loops.iter().flat_map(|(_, l, _)| ring_around(l, reach).0).collect());
+        let left = region(area).difference(&swept);
+        // tool centres within a radius of what is left (a hair less, so the
+        // outer loop just touches it), where the tool centre may go
+        let mut grown: Vec<Vec<P2>> = vec![];
+        for p in &left.0 {
+            let ext = from_geo_ring(p.exterior());
+            if ext.len() < 3 || signed_area(&ext).abs() < 1e-6 {
+                continue;
+            }
+            let hs: Vec<Vec<P2>> = p.interiors().iter().map(from_geo_ring).collect();
+            grown.extend(offset_region(&ext, &hs, -(r - 0.05).max(0.0)));
+        }
+        // the union of many rings is jagged: smooth it (well inside the
+        // overlaps) so the offsetter copes
+        use geo::Simplify;
+        region(&grown).intersection(&region(allowed)).simplify(&MESH_SIMPLIFY)
+    }));
+    let Ok(left) = res else { return vec![] };
+    let mut out = vec![];
+    for p in &left.0 {
+        let ext = from_geo_ring(p.exterior());
+        if ext.len() < 3 || signed_area(&ext).abs() < 1e-4 {
+            continue; // slivers
+        }
+        let hs: Vec<Vec<P2>> = p.interiors().iter().map(from_geo_ring).collect();
+        // the edge (a hair in: a zero offset gives nothing), then inwards a
+        // stepover at a time
+        let mut j = 0;
+        loop {
+            let ls = offset_region(&ext, &hs, 1e-3 + j as f64 * step);
+            if ls.is_empty() || j > 10000 {
+                break;
+            }
+            out.extend(ls.into_iter().map(|l| (k0 + j, l, false)));
+            j += 1;
+        }
+    }
+    out
+}
+
+/// Radius of adaptive clearing's trochoidal loops (fraction of the cutter Ø).
+const TROCHOID_R: f64 = 0.4;
+
 /// Trochoidal path along a closed centre path (already closed).
 fn trochoid(center: &[P2], radius: f64, advance: f64) -> Vec<P2> {
     let l = path_len(center);
@@ -1243,10 +1331,11 @@ fn pocket_moves(op: &PocketOp, retract: f64, from: P2) -> Result<Vec<Mv>, String
 
     // centre loops for roughing, with their offset index
     let step = (op.stepover_pct / 100.0 * d).max(0.01);
-    let mut centre: Vec<(usize, Vec<P2>)> = Vec::new();
+    // (offset index, loop, cut with trochoids)
+    let mut centre: Vec<(usize, Vec<P2>, bool)> = Vec::new();
     let mut troch_r = 0.0;
     if op.strategy == Strategy::Adaptive {
-        troch_r = 0.4 * d;
+        troch_r = TROCHOID_R * d;
         let spacing = 1.4 * d;
         let mut k = 0;
         loop {
@@ -1254,11 +1343,17 @@ fn pocket_moves(op: &PocketOp, retract: f64, from: P2) -> Result<Vec<Mv>, String
             if ls.is_empty() || k > 10000 {
                 break;
             }
-            centre.extend(ls.into_iter().map(|l| (k, l)));
+            centre.extend(ls.into_iter().map(|l| (k, l, true)));
             k += 1;
         }
         if centre.is_empty() {
             troch_r = 0.0; // too narrow for trochoids: fall back to standard loops
+        } else {
+            // the loops from opposite walls stop up to a spacing short of each
+            // other: clear what they leave with standard loops (cut first,
+            // innermost first)
+            let finish_area = offset_region(&op.outer, &islands, op.finish.max(0.0));
+            centre.extend(adaptive_cleanup(&centre, &finish_area, &allowed, troch_r + r, r, step, k));
         }
     }
     if centre.is_empty() {
@@ -1268,7 +1363,7 @@ fn pocket_moves(op: &PocketOp, retract: f64, from: P2) -> Result<Vec<Mv>, String
             if ls.is_empty() || k > 10000 {
                 break;
             }
-            centre.extend(ls.into_iter().map(|l| (k, l)));
+            centre.extend(ls.into_iter().map(|l| (k, l, false)));
             k += 1;
         }
     }
@@ -1293,7 +1388,7 @@ fn pocket_moves(op: &PocketOp, retract: f64, from: P2) -> Result<Vec<Mv>, String
                 .unwrap();
             let ci = remaining.remove(ri);
             let loop_c = start_near(&centre[ci].1, here);
-            let path: Vec<P2> = if troch_r > 0.0 { trochoid(&loop_c, troch_r, step) } else { loop_c };
+            let path: Vec<P2> = if centre[ci].2 { trochoid(&loop_c, troch_r, step) } else { loop_c };
             let p0 = path[0];
 
             if first {
@@ -1324,7 +1419,14 @@ fn pocket_moves(op: &PocketOp, retract: f64, from: P2) -> Result<Vec<Mv>, String
         z_prev = z;
     }
 
-    // finishing pass on all walls, each level top-down
+    // finishing pass on all walls, each level top-down (roughing: only the
+    // part's walls, or none)
+    let finish_loops: Vec<Vec<P2>> = if op.no_contour {
+        vec![]
+    } else {
+        finish_loops.into_iter().filter(|l| !(op.open_outer && signed_area(l) > 0.0)).collect()
+    };
+    let mut z_above = op.start_z;
     for &z in &zs {
         for fl in &finish_loops {
             let here = [out.pos[0], out.pos[1]];
@@ -1340,7 +1442,10 @@ fn pocket_moves(op: &PocketOp, retract: f64, from: P2) -> Result<Vec<Mv>, String
             if out.pos[2] <= z + 1e-9 && ctx.seg_ok(here, lead) {
                 out.feed([lead[0], lead[1], z], op.feed);
             } else {
-                out.reposition(retract, lead, z + 0.5);
+                // down to just above the level before (clear everywhere the
+                // tool can be), then feed: at this level the clearing may
+                // stop a hair short of the tool radius in corners
+                out.reposition(retract, lead, (z_above + 0.5).min(retract));
                 out.feed([lead[0], lead[1], z], op.feed);
             }
             for q in &lp {
@@ -1348,6 +1453,7 @@ fn pocket_moves(op: &PocketOp, retract: f64, from: P2) -> Result<Vec<Mv>, String
             }
             out.feed([lead[0], lead[1], z], op.feed);
         }
+        z_above = z;
     }
     out.rapid([out.pos[0], out.pos[1], retract]);
     Ok(out.moves)
@@ -1718,7 +1824,9 @@ fn grow_convex(q: &[P2], eps: f64) -> Vec<P2> {
         let dot = n1[0] * n2[0] + n1[1] * n2[1];
         let m = [n1[0] + n2[0], n1[1] + n2[1]];
         let k = eps / (1.0 + dot).max(1e-9);
-        if (m[0] * k).hypot(m[1] * k) <= 4.0 * eps {
+        // mitre only mild corners: slivers' sharp corners would spike out
+        // (finishing laps follow these outlines)
+        if (m[0] * k).hypot(m[1] * k) <= 1.5 * eps {
             out.push([c[0] + m[0] * k, c[1] + m[1] * k]);
         } else {
             // sharp corner: bevel with both edge offsets
@@ -1776,8 +1884,10 @@ pub struct RoughGeom {
 pub fn rough_geom(op: &RoughOp) -> Result<RoughGeom, String> {
     let a = op.allowance.max(0.0);
     // the clearing keeps the tool centre r + a inside this boundary, so grow
-    // by 2(r + a) + OPEN_EDGE for centres out to profile + r + a + OPEN_EDGE
-    let g = op.cutter.dia() + 2.0 * a + OPEN_EDGE;
+    // by 2(r + a) + OPEN_EDGE for centres out to profile + r + a + OPEN_EDGE;
+    // adaptive clearing also needs room for its trochoidal loops round the
+    // outside profile (else it would slot it full width)
+    let g = op.cutter.dia() + 2.0 * a + OPEN_EDGE + op.band_extra();
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let full: Vec<geo::MultiPolygon<f64>> = op
             .faces
@@ -1895,6 +2005,17 @@ fn ramp_loop(seq: &[P2], z_from: f64, z: f64, feed: f64, tan: f64, retract: f64)
 }
 
 impl RoughOp {
+    /// How much wider than one tool diameter (+ stock to leave) the band
+    /// cleared round the outside profile is: adaptive clearing needs room for
+    /// its trochoidal loops (else it would slot the profile full width).
+    pub fn band_extra(&self) -> f64 {
+        if self.strategy == Strategy::Adaptive {
+            2.0 * TROCHOID_R * self.cutter.dia() + OPEN_EDGE
+        } else {
+            0.0
+        }
+    }
+
     /// Highest point of the part.
     pub fn part_top(&self) -> f64 {
         self.faces.iter().map(|f| f.z).fold(f64::NEG_INFINITY, f64::max)
@@ -1934,11 +2055,15 @@ fn rough_moves(op: &RoughOp, retract: f64) -> Result<Vec<Mv>, String> {
             let rect = vec![vec![[x0 - e, y0 - e], [x1 + e, y0 - e], [x1 + e, y1 + e], [x0 - e, y1 + e]]];
             out.extend(facing_moves(&rect, &[vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]], cut, retract));
         } else {
-            out.extend(facing_moves(&grow_loops(&outline, r + a + OPEN_EDGE), &outline, cut, retract));
+            // over the same band the layers clear, rows across all of it
+            let band = grow_loops(&outline, r + a + OPEN_EDGE + op.band_extra());
+            out.extend(facing_moves(&band, &band, cut, retract));
         }
         z_prev = fz;
     }
     let geom = rough_geom(op)?;
+    // the clearing band's outer limit (not a wall of the part)
+    let band: Vec<Vec<P2>> = geom.grown.0.iter().map(|p| from_geo_ring(p.exterior())).collect();
     let below = z_prev; // levels above the faced height are already done
     // areas cleared on the previous layer, shrunk for the tool (None: none yet)
     let mut prev_safe: Option<Vec<Vec<Vec<P2>>>> = None;
@@ -1984,7 +2109,10 @@ fn rough_moves(op: &RoughOp, retract: f64) -> Result<Vec<Mv>, String> {
                     out.extend(ramp_loop(&seq, z_prev, z, op.feed, tan, retract));
                 }
                 Job::Clear(outer, islands) => {
+                    let open_outer = outer.iter().take(3).all(|&p| boundary_dist(&band, p) < 1e-4);
                     let pocket = PocketOp {
+                        no_contour: !op.finish_layers,
+                        open_outer,
                         z,
                         start_z: z_prev,
                         depth_per_pass: z_prev - z + 1.0,
@@ -2026,6 +2154,104 @@ fn rough_moves(op: &RoughOp, retract: f64) -> Result<Vec<Mv>, String> {
         return Err("roughing found nothing to cut".into());
     }
     Ok(out)
+}
+
+/// Default Z step of a new Finish op (mm).
+pub const FINISH_STEP: f64 = 0.1;
+
+/// Finish ops with no enabled Rough op before them: (op index, warning).
+pub fn finish_warnings(ops: &[StepOp]) -> Vec<(usize, String)> {
+    let mut roughed = false;
+    let mut out = vec![];
+    for (i, o) in ops.iter().enumerate().filter(|(_, o)| o.enabled) {
+        match o.kind {
+            OpKind::Rough(_) => roughed = true,
+            OpKind::Finish(_) if !roughed => out.push((i, "no Rough op before this Finish: it only laps round the part walls, so uncut stock is left (and met) elsewhere".to_string())),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// How far above a layer a Finish op may rapid down to before a lap: the
+/// last enabled Rough op before it (with a cutter no bigger) left nothing
+/// higher than one roughing layer above any finishing layer; without one,
+/// only down to the Finish start.
+fn finish_clearance(before: &[StepOp], fin: &RoughOp) -> Option<f64> {
+    before.iter().rev().filter(|o| o.enabled).find_map(|o| match &o.kind {
+        OpKind::Rough(r) if r.cutter.dia() <= fin.cutter.dia() + 1e-9 => Some(r.layer_height + r.allowance.max(0.0) + 0.5),
+        _ => None,
+    })
+}
+
+/// Finishing: at every layer (Z step `layer_height`, plus every flat floor
+/// and the top and foot of every slope), one climb-milled lap round each of
+/// the part's walls at tool radius + stock to leave - outside walls CW,
+/// pocket and hole walls CCW. Nothing else is cut. Laps of the same wall on
+/// consecutive layers link with a short feed move; other moves go up to the
+/// retract height and come down to `clearance` above the layer (None: to the
+/// op's start Z) before feeding down.
+fn finish_moves(op: &RoughOp, retract: f64, clearance: Option<f64>) -> Result<Vec<Mv>, String> {
+    let r = op.cutter.dia() / 2.0;
+    let a = op.allowance.max(0.0);
+    let geom = rough_geom(op)?;
+    // the clearing band's outer limit is not part geometry
+    let band: Vec<Vec<P2>> = geom.grown.0.iter().map(|p| from_geo_ring(p.exterior())).collect();
+    // segment inside a set of allowed regions (tool centre clear of the part)
+    let clear = |safe: &[Vec<Vec<P2>>], p: P2, q: P2| {
+        let n = ((d2(p, q) / 0.1).ceil() as usize).max(1);
+        (0..=n).all(|k| {
+            let t = k as f64 / n as f64;
+            let x = [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t];
+            safe.iter().any(|l| inside(l, x) || boundary_dist(l, x) < 1e-3)
+        })
+    };
+    let mut path = Path::new([0.0, 0.0, retract]);
+    let mut started = false;
+    let mut prev_safe: Vec<Vec<Vec<P2>>> = vec![];
+    let mut z_prev = op.start_z;
+    for z in rough_levels(op).into_iter().filter(|&z| z < op.start_z - 1e-6) {
+        let layer = rough_layer_in(op, &geom, z)?;
+        let mut safe: Vec<Vec<Vec<P2>>> = vec![];
+        let mut loops: Vec<Vec<P2>> = vec![];
+        for (outer, islands) in &layer.regions {
+            let allowed = offset_region(outer, islands, r + a);
+            if allowed.is_empty() {
+                continue;
+            }
+            let band_edge = outer.iter().take(3).all(|&p| boundary_dist(&band, p) < 1e-4);
+            loops.extend(allowed.iter().filter(|l| !(band_edge && signed_area(l) > 0.0)).cloned());
+            safe.push(allowed);
+        }
+        let mut left = loops;
+        while !left.is_empty() {
+            let here = [path.pos[0], path.pos[1]];
+            let k = (0..left.len()).min_by(|&x, &y| near_dist(&left[x], here).total_cmp(&near_dist(&left[y], here))).unwrap();
+            let seq = start_near(&left.swap_remove(k), here);
+            let s0 = seq[0];
+            let zh = path.pos[2];
+            // the same wall one layer down (or a neighbour close by): a short
+            // feed across, never closer to the part than the laps
+            let near = started && d2(here, s0) <= 2.0 * r;
+            let low = near && (((zh - z).abs() < 1e-9 && clear(&safe, here, s0)) || ((zh - z_prev).abs() < 1e-9 && clear(&prev_safe, here, s0)));
+            if low {
+                path.feed([s0[0], s0[1], zh], op.feed);
+            } else {
+                let down = clearance.map_or(op.start_z + 0.5, |c| z + c).max(z + 0.5).min(retract);
+                path.reposition(retract, s0, down);
+            }
+            path.feed([s0[0], s0[1], z], op.feed * 0.5);
+            walk(&mut path, &seq, true, path_len(&seq), &|_| z, op.feed);
+            started = true;
+        }
+        prev_safe = safe;
+        z_prev = z;
+    }
+    if !started {
+        return Err("finishing found no part walls to cut".into());
+    }
+    path.rapid([path.pos[0], path.pos[1], retract]);
+    Ok(path.moves)
 }
 
 // ------------------------------------------------------------------ tabs
@@ -2215,6 +2441,7 @@ pub fn validate(op: &StepOp, s: &Settings, tabs_top: f64) -> Vec<String> {
         OpKind::Pocket(p) => (p.start_z, p.z, p.cutter, p.depth_per_pass, p.feed, p.speed),
         OpKind::Profile(p) => (p.start_z, p.z, p.cutter, p.depth_per_pass, p.feed, p.speed),
         OpKind::Rough(r) => (r.start_z, r.final_z(), r.cutter, r.layer_height, r.feed, r.speed),
+        OpKind::Finish(r) => (r.start_z, r.bottom_z, r.cutter, r.layer_height, r.feed, r.speed),
         OpKind::Engrave(g) => {
             if !g.tool.in_table(s) {
                 e.push(format!("T{} is not in the tool table", g.tool.tool_number()));
@@ -2275,6 +2502,14 @@ pub fn validate(op: &StepOp, s: &Settings, tabs_top: f64) -> Vec<String> {
             e.push(format!("cutter Ø{} does not fit in the pocket", fmt(cutter.dia())));
         }
     }
+    if let OpKind::Finish(r) = &op.kind {
+        if r.allowance < 0.0 {
+            e.push("stock to leave must be >= 0".into());
+        }
+        if r.faces.is_empty() {
+            e.push("no model faces - import a STEP model".into());
+        }
+    }
     if let OpKind::Rough(r) = &op.kind {
         if !(r.ramp_angle > 0.0 && r.ramp_angle <= 45.0) {
             e.push("ramp angle must be > 0 and <= 45 degrees".into());
@@ -2329,7 +2564,7 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
     }
     let cutting: Vec<(usize, &StepOp)> = job.ops.iter().enumerate().filter(|(_, o)| o.enabled && !matches!(o.kind, OpKind::Tab(_))).collect();
     if cutting.is_empty() && errors.is_empty() {
-        errors.push("no Face, Pocket, Profile, Rough, Engrave or Thread operations - right-click a surface or an edge in the 3D view".into());
+        errors.push("no Face, Pocket, Profile, Rough, Finish, Engrave or Thread operations - right-click a surface or an edge in the 3D view".into());
     }
     if !errors.is_empty() {
         return Err(errors);
@@ -2378,7 +2613,7 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
             OpKind::Face(f) => (mill(f.cutter), f.speed, f.start_z),
             OpKind::Pocket(p) => (mill(p.cutter), p.speed, p.start_z),
             OpKind::Profile(p) => (mill(p.cutter), p.speed, p.start_z),
-            OpKind::Rough(r) => (mill(r.cutter), r.speed, r.start_z),
+            OpKind::Rough(r) | OpKind::Finish(r) => (mill(r.cutter), r.speed, r.start_z),
             OpKind::Engrave(g) => ((g.tool.tool_number(), g.tool.width_at(g.depth) / 2.0, g.tool.describe()), g.speed, g.z),
             OpKind::Tab(_) | OpKind::Thread(_) => unreachable!(),
         };
@@ -2390,6 +2625,10 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
                 Err(e) => return Err(vec![format!("op {}: {e}", i + 1)]),
             },
             OpKind::Rough(r) => match rough_moves(&rough_with_keepouts(r, &holes), retract) {
+                Ok(m) => m,
+                Err(e) => return Err(vec![format!("op {}: {e}", i + 1)]),
+            },
+            OpKind::Finish(r) => match finish_moves(&rough_with_keepouts(r, &holes), retract, finish_clearance(&job.ops[..i], r)) {
                 Ok(m) => m,
                 Err(e) => return Err(vec![format!("op {}: {e}", i + 1)]),
             },
@@ -3722,5 +3961,233 @@ mod z_anchor_tests {
         assert_eq!(old.z_anchor, ZAnchor::Bottom);
         let s: Stock = serde_json::from_str(r#"{"z": 3, "z_anchor": "middle"}"#).unwrap();
         assert_eq!(s.z_anchor, ZAnchor::Middle);
+    }
+}
+
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+    use crate::toolpath;
+
+    /// a.step's height at radius `rho` (see rough_stock_tests).
+    fn height(rho: f64) -> f64 {
+        if rho <= 2.0 {
+            14.0
+        } else if rho <= 5.0 {
+            14.0 - (rho - 2.0)
+        } else if rho <= 7.0 {
+            5.0
+        } else if rho <= 10.0 {
+            2.0 + (9.0 - (rho - 7.0).powi(2)).max(0.0).sqrt()
+        } else {
+            f64::NEG_INFINITY
+        }
+    }
+
+    /// Distance from radius `rho` to the part's material at height `z`
+    /// (material: where the part stands above z; 0 inside it).
+    fn dist_to_material(rho: f64, z: f64) -> f64 {
+        let mut d = f64::INFINITY;
+        let mut m = 0.0;
+        while m <= 10.0 {
+            if height(m) > z + 1e-6 {
+                d = d.min((rho - m).abs());
+            }
+            m += 0.0005;
+        }
+        d
+    }
+
+    fn a_step_job(with_rough: bool) -> (StepJob, crate::step::Model, (P3, P3)) {
+        let m = crate::step::parse_model(include_str!("../testdata/a.step")).unwrap();
+        let stock = Stock { z: 1.0, ..Default::default() }.bounds(m.min, m.max);
+        let base = RoughOp { cutter: Cutter::C3x17, start_z: stock.1[2], bottom_z: m.min[2], faces: rough_faces(&m), stock_region: [stock.0[0], stock.0[1], stock.1[0], stock.1[1]], ..Default::default() };
+        let finish = RoughOp { start_z: m.max[2], layer_height: FINISH_STEP, ..base.clone() };
+        let mut ops = vec![];
+        if with_rough {
+            ops.push(StepOp { enabled: true, kind: OpKind::Rough(base) });
+        }
+        ops.push(StepOp { enabled: true, kind: OpKind::Finish(finish) });
+        (StepJob { ops, ..Default::default() }, m, stock)
+    }
+
+    #[test]
+    fn laps_run_round_the_walls_at_tool_radius() {
+        let (job, _, _) = a_step_job(false);
+        let code = generate(&job, &Settings { safe_z: 25.0, ..Default::default() }).unwrap();
+        let tp = toolpath::parse(&code);
+        let (r, mut laps) = (1.5, 0);
+        for p in tp.paths.iter().filter(|p| p.kind != toolpath::MoveKind::Rapid) {
+            for (k, w) in p.pts.windows(2).enumerate() {
+                // the laps: level moves along the wall (not the short links
+                // across to the next layer's lap, which drop straight after)
+                if (w[0][2] - w[1][2]).abs() > 1e-6 || ((w[0][0] - w[1][0]).hypot(w[0][1] - w[1][1])) < 0.05 {
+                    continue;
+                }
+                if let Some(n) = p.pts.get(k + 2) {
+                    if (n[0] - w[1][0]).abs() < 1e-6 && (n[1] - w[1][1]).abs() < 1e-6 && n[2] < w[1][2] {
+                        continue;
+                    }
+                }
+                let (z, rho) = (w[1][2] as f64, (w[1][0] as f64).hypot(w[1][1] as f64));
+                // r from the nearest wall (mesh outlines are grown by up to
+                // 1.5 MESH_GROW on the material side)
+                let d = dist_to_material(rho, z);
+                assert!(d >= r - 0.03 && d <= r + 1.5 * MESH_GROW + 0.03, "lap at Z{z} rho {rho}: {d} from the part");
+                laps += 1;
+            }
+        }
+        assert!(laps > 1000, "{laps}");
+        // 0.1 mm steps from the part top down: about 140 levels
+        let OpKind::Finish(f) = &job.ops[0].kind else { unreachable!() };
+        assert!(rough_levels(f).len() >= 140);
+    }
+
+    #[test]
+    fn rough_then_finish_leaves_the_part_at_size_without_gouges() {
+        let (job, m, stock) = a_step_job(true);
+        let s = Settings { safe_z: 25.0, ..Default::default() };
+        let left = |job: &StepJob| {
+            let code = generate(job, &s).unwrap();
+            let mut sim = crate::sim::Sim::new(crate::sim::Program::parse(&code, &s), stock.0, stock.1, 250);
+            while !sim.seek(f64::INFINITY, std::time::Duration::from_secs(60)) {}
+            assert!(!sim.events.values().any(|e| e.kind == crate::sim::EventKind::RapidCut), "{:?}", sim.events);
+            let part = sim.map.surface_of(crate::sim::top_tris(&m));
+            let d: Vec<f32> = sim.map.z.iter().zip(&part).filter(|(_, p)| !p.is_nan()).map(|(z, p)| z - p).collect();
+            assert!(d.iter().all(|&d| d > -0.07), "gouge {}", d.iter().cloned().fold(0f32, f32::min));
+            // waterline steps leave cusps up to the Z step (plus the mesh
+            // margin on curved walls): count what is clearly more
+            d.iter().filter(|&&d| d > 0.25).count()
+        };
+        let rough_only = StepJob { ops: job.ops[..1].to_vec(), ..job.clone() };
+        let (before, after) = (left(&rough_only), left(&job));
+        assert!(after * 4 < before, "cells with > 0.25 mm left: rough {before}, rough + finish {after}");
+    }
+
+    #[test]
+    fn warns_without_a_rough_before_it() {
+        let (job, _, _) = a_step_job(false);
+        assert_eq!(finish_warnings(&job.ops).len(), 1);
+        let (mut job, _, _) = a_step_job(true);
+        assert!(finish_warnings(&job.ops).is_empty());
+        job.ops[0].enabled = false;
+        assert_eq!(finish_warnings(&job.ops)[0].0, 1);
+        job.ops.swap(0, 1);
+        job.ops[1].enabled = true;
+        assert_eq!(finish_warnings(&job.ops).len(), 1, "rough after the finish does not count");
+    }
+}
+
+#[cfg(test)]
+mod adaptive_band_tests {
+    use super::*;
+    use crate::toolpath;
+
+    fn a_step(strategy: Strategy, finish_layers: bool) -> (StepJob, crate::step::Model, (P3, P3)) {
+        let m = crate::step::parse_model(include_str!("../testdata/a.step")).unwrap();
+        let stock = Stock { x: 10.0, y: 10.0, z: 1.0, ..Default::default() }.bounds(m.min, m.max);
+        let op = RoughOp {
+            cutter: Cutter::C3x17,
+            start_z: stock.1[2],
+            bottom_z: m.min[2],
+            faces: rough_faces(&m),
+            stock_region: [stock.0[0], stock.0[1], stock.1[0], stock.1[1]],
+            strategy,
+            finish_layers,
+            ..Default::default()
+        };
+        (StepJob { ops: vec![StepOp { enabled: true, kind: OpKind::Rough(op) }], ..Default::default() }, m, stock)
+    }
+
+    fn feed_rho(job: &StepJob) -> (Vec<f64>, usize) {
+        let code = generate(job, &Settings { safe_z: 25.0, ..Default::default() }).unwrap();
+        let tp = toolpath::parse(&code);
+        let pts: Vec<f64> = tp.paths.iter().filter(|p| p.kind != toolpath::MoveKind::Rapid).flat_map(|p| p.pts.iter()).filter(|p| p[2] < 4.0).map(|p| (p[0] as f64).hypot(p[1] as f64)).collect();
+        (pts, code.lines().count())
+    }
+
+    #[test]
+    fn adaptive_mills_the_outside_profile_with_trochoids() {
+        let (r, d) = (1.5, 3.0);
+        let (std_rho, _) = feed_rho(&a_step(Strategy::Standard, true).0);
+        let (ad_rho, _) = feed_rho(&a_step(Strategy::Adaptive, true).0);
+        let max = |v: &[f64]| v.iter().cloned().fold(0.0, f64::max);
+        let edge = 10.0 + 1.5 * MESH_GROW + r + OPEN_EDGE;
+        // standard: one pass round the outside at tool radius
+        assert!(max(&std_rho) <= edge + 0.01, "{}", max(&std_rho));
+        // adaptive: the loops swing out over the widened band, but no further
+        let m = max(&ad_rho);
+        assert!(m > edge + 0.5 * d && m <= edge + 2.0 * TROCHOID_R * d + OPEN_EDGE + 0.01, "adaptive reaches rho {m}");
+        // and many points out there: loops, not one pass
+        assert!(ad_rho.iter().filter(|&&p| p > edge + 0.3 * d).count() > 200);
+    }
+
+    #[test]
+    fn adaptive_rough_does_not_gouge_and_finish_each_layer_toggles_the_contours() {
+        for finish in [true, false] {
+            let (job, m, stock) = a_step(Strategy::Adaptive, finish);
+            let s = Settings { safe_z: 25.0, ..Default::default() };
+            let code = generate(&job, &s).unwrap();
+            let mut sim = crate::sim::Sim::new(crate::sim::Program::parse(&code, &s), stock.0, stock.1, 250);
+            while !sim.seek(f64::INFINITY, std::time::Duration::from_secs(60)) {}
+            assert!(!sim.events.values().any(|e| e.kind == crate::sim::EventKind::RapidCut), "{:?}", sim.events);
+            let part = sim.map.surface_of(crate::sim::top_tris(&m));
+            let worst = sim.map.z.iter().zip(&part).filter(|(_, p)| !p.is_nan()).map(|(z, p)| p - z).fold(0f32, f32::max);
+            assert!(worst < 0.07, "finish_layers {finish}: gouge {worst}");
+        }
+        let (_, with) = feed_rho(&a_step(Strategy::Adaptive, true).0);
+        let (_, without) = feed_rho(&a_step(Strategy::Adaptive, false).0);
+        assert!(without < with, "contour passes add moves: {without} vs {with}");
+        // old jobs without the field finish each layer
+        let old: RoughOp = serde_json::from_str("{}").unwrap();
+        assert!(old.finish_layers);
+    }
+}
+
+
+#[cfg(test)]
+mod adaptive_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn wide_adaptive_pocket_is_cleared_everywhere() {
+        // 40 x 26 pocket, 2 deep, Ø3: the trochoid loops from opposite walls
+        // stop short of each other; the cleanup must clear the middle
+        for (w, h) in [(40.0, 26.0), (30.0, 30.0), (37.0, 11.0)] {
+            let op = PocketOp {
+                z: -2.0,
+                outer: vec![[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]],
+                cutter: Cutter::C3x17,
+                strategy: Strategy::Adaptive,
+                finish: 0.0,
+                ..Default::default()
+            };
+            let job = StepJob { ops: vec![StepOp { enabled: true, kind: OpKind::Pocket(op) }], ..Default::default() };
+            let s = Settings { safe_z: 10.0, ..Default::default() };
+            let code = generate(&job, &s).unwrap();
+            let mut sim = crate::sim::Sim::new(crate::sim::Program::parse(&code, &s), [-2.0, -2.0, -5.0], [w + 2.0, h + 2.0, 0.0], 300);
+            while !sim.seek(f64::INFINITY, std::time::Duration::from_secs(60)) {}
+            assert!(!sim.events.values().any(|e| e.kind == crate::sim::EventKind::RapidCut), "{w}x{h}: {:?}", sim.events);
+            let m = &sim.map;
+            let mut left = 0;
+            for j in 0..m.ny {
+                for i in 0..m.nx {
+                    let [x, y] = m.centre(i, j);
+                    let wall = x.min(w - x).min(y).min(h - y);
+                    // reachable: within a radius (less a margin) of where the
+                    // tool centre may go (corners stay round)
+                    let r = 1.5;
+                    let (dx, dy) = ((r - x).max(x - (w - r)).max(0.0), (r - y).max(y - (h - r)).max(0.0));
+                    if dx.hypot(dy) < r - 0.1 && m.z[j * m.nx + i] > -2.0 + 1e-3 {
+                        left += 1;
+                    }
+                    // and never into the walls
+                    if wall < -0.05 {
+                        assert!(m.z[j * m.nx + i] > -1e-3, "{w}x{h}: wall cut at ({x}, {y})");
+                    }
+                }
+            }
+            assert_eq!(left, 0, "{w}x{h}: cells left above the floor");
+        }
     }
 }

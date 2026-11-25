@@ -1,11 +1,8 @@
 # stepCAM User Guide
 
-stepCAM turns a part into G-code for a 3-axis CNC mill. It does two jobs:
+stepCAM turns a part into G-code for a 3-axis CNC mill. It imports a STEP model and machines it from above with facing, pocketing, profiling, roughing, engraving and thread milling (helical boring and thread milling of M2 to M6 holes).
 
-- **Thread milling:** bores holes with a helix and thread-mills them (M2 to M6), from a list of X, Y locations.
-- **Step milling:** imports a STEP model and machines it from above with facing, pocketing, profiling, roughing, engraving and thread milling.
-
-The **Simulator** tab plays either program against a block of stock, so you can check it before it goes near the machine.
+The **Simulator** tab plays the program against a block of stock, so you can check it before it goes near the machine.
 
 All units are millimetres. Programs are climb milled throughout, for a spindle turning clockwise (M3).
 
@@ -17,7 +14,7 @@ A typical step milling session:
 2. On **Step Milling**, click **📂 Import STEP…** and open your part.
 3. Place the part. Right-click its bottom face and choose **Lay flat on this surface**, or use **Set Z…** to put a surface at a chosen height.
 4. Set the **Stock** size, for example 2 mm extra on every side.
-5. Add operations. **➕ Rough** is usually first. Then right-click surfaces and edges to add facing, pockets, profiles, engraving and thread milling.
+5. Add operations. **➕ Rough** is usually first, and **➕ Finish** after it cleans up the walls. Then right-click surfaces and edges to add facing, pockets, profiles, engraving and thread milling.
 6. Open **Simulator**, press ⏭ and check the result. Look for red gouges and for warnings.
 7. Type a file name next to **G-code file:** and click **💾 Save G-code**.
 8. Click **Save** next to **Job file:** to keep the whole job for later.
@@ -26,13 +23,13 @@ The G-code updates by itself whenever you change something, so there is no Gener
 
 ## The window
 
-- **Tabs** along the top: **Thread Milling**, **Step Milling**, **Simulator** and **Tools & Settings**. There is also a **❓ Help** button, which opens this guide (F1 does the same).
+- **Tabs** along the top: **Step Milling**, **Simulator** and **Tools & Settings**. There is also a **❓ Help** button, which opens this guide (F1 does the same).
 - **File bar** under the tabs:
   - **Job file:** with **Load** and **Save**.
   - **G-code file:** with **💾 Save G-code**.
   - The G-code line count and the **Estimated run time**.
   - Errors that stop the program being generated, and status messages.
-- **G-code panel** on the right: the program for the current tab.
+- **G-code panel** on the right: the step milling program.
   - **📋 Copy** puts the whole program on the clipboard.
   - Click a line, or move through the lines with the arrow keys, to highlight its move in the 3D view.
 - **3D view:** see the next section.
@@ -49,7 +46,7 @@ The G-code updates by itself whenever you change something, so there is no Gener
 ### Toolpath colours
 
 - **Red, faint:** rapid moves (G0).
-- **Blue:** hole milling (thread milling tab) or milling (step milling).
+- **Blue:** milling, including boring holes for threads.
 - **Orange:** threading.
 - **Cyan:** the move of the G-code line you clicked. A hollow dot marks where it starts, a filled dot where it ends.
 
@@ -58,50 +55,17 @@ The checkboxes above the view switch each kind on or off. **Esc** clears the sel
 ## Jobs and files
 
 - **Job file** (`.stepcam.json`): the whole job, which includes:
-  - thread groups;
   - step milling operations;
   - stock;
   - model placement;
   - machining settings and tool tables;
   - the path of the STEP file.
 
-  **Load** opens the job and re-imports the STEP model from that path. Keep the STEP file where it was, or re-import it.
-- **G-code file:** the program for the current tab. On the Simulator tab it is the program being simulated. Saving is refused while the program has errors.
+  **Load** opens the job and re-imports the STEP model from that path. Keep the STEP file where it was, or re-import it. Thread groups in jobs saved with the old Thread Milling tab become thread milling items in the operations list, with their typed locations.
+- **G-code file:** the step milling program. Saving is refused while the program has errors.
 - **Settings file:** **💾 Save settings… / 📂 Load settings…** on the Tools & Settings tab store only the machining settings and tool tables. Use this to share one tool table between jobs.
 
 Typed paths are relative to the folder stepCAM was started from.
-
-## Thread Milling tab
-
-This tab makes a program that bores and threads holes at X, Y locations you type in. No model is needed.
-
-### Settings at the top
-
-- **Spindle speed:** for boring and threading.
-- **Rapid plane Z:** absolute Z for rapids between groups and for tool changes.
-- **Milling feed:** helical boring feed at the cutter centre.
-- **Threading feed:** at the cutting edge. The feed at the tool centre is reduced automatically.
-- **Milling down angle:** the default helix descent angle for new groups. **Apply to all groups** copies it to every group.
-
-### Thread groups
-
-Each row of the **Thread Locations** table is a group of identical holes:
-
-- **Thread:** M2, M2.5, M3, M4, M5 or M6.
-- **Hole start Z:** the top of the material at the holes. All hole geometry is below it.
-- **Thread length:** how deep the thread goes, from 0 to 100 mm.
-- **Descent angle:** the helix angle while boring.
-- **Milling cutter:** the end mill that bores the hole. Only cutters smaller than the tap-drill hole can be chosen.
-- **Locations:** one per line, as `x, y` or `X10 Y20`.
-
-The row shows the hole Ø, its depth and bottom Z, the pitch and the number of holes, with **✔ OK** or a list of problems. The buttons ⬆ ⬇ ⧉ 🗑 move, duplicate or remove the group. **➕ Add group** adds a new one.
-
-### How the holes are cut
-
-- **Hole depth:** the thread length plus one pitch.
-- **Boring:** the hole is bored to the tap-drill Ø with a helix, in rings set by **Boring ring stepover** on Tools & Settings.
-- **Threading:** the thread mill goes to the bottom of the thread and climbs out with G3, so the thread stops one pitch above the bottom of the hole.
-- **Order:** all holes are bored first, then all are threaded, so there are as few tool changes as possible. Boring visits the holes nearest-next, and threading runs the same route backwards, starting where boring ended.
 
 ## Step Milling tab
 
@@ -207,9 +171,23 @@ Every operation has a **Tool** (from the tool table), **Feed** (mm/min) and **Sp
 - **Clear voids** (default on): pockets, steps and counterbores are always cleared. When unticked, holes that go right through the part are only profiled round their wall, so the core can drop out.
 - **Overcut Z:** carries the last layer this far below Bottom Z, for example to cut the part free.
 - **Strategy:** **Standard** (concentric offset passes) or **Adaptive clearing** (trochoidal loops, with their own advance per loop).
+  - With adaptive clearing, the band round the outside profile is widened by the loops' diameter (0.8 × tool Ø), so the outside profile is cut with trochoidal loops too instead of a full-width slot. Facing covers the same wider band.
+  - Wide areas are fully cleared: what the loops leave between each other (along the middle of wide regions, and in corners) is cleared with standard passes first.
+- **Finish each layer** (default on): after clearing each layer, a climb-milled pass round the part's walls at tool radius + stock to leave. This cleans up the scallops that adaptive clearing leaves. The outer limit of the band is not a wall and is left out. Untick it to clear only.
 - **Entry:** **Helix**, **Zigzag** or **Plunge**. **Ramp angle** is the helix or zigzag angle.
 
 Roughing sees the part from above, so undercuts can't be reached. Hops between cuts stay low (0.5 mm above the layer above) when they only pass over ground already cleared. Otherwise they go up to the retract height.
+
+### Finish
+
+**➕ Finish**, next to **➕ Rough**, adds wall finishing. It goes after the roughing ops in the list. At every layer, from the part top (**Start Z**) down to **Bottom Z**, it runs one climb-milled lap round each of the part's walls at the tool radius. Outside walls are cut clockwise, and pocket and hole walls anticlockwise. Nothing else is cut, so roughing has to clear the stock first.
+
+- **Z step:** the height between laps, 0.1 mm by default. Extra laps are added at every flat floor and at the top and foot of every slope, as for Rough.
+- **Stock to leave:** left on the walls. The default 0 cuts them to size.
+- **Tool, Feed, Speed.**
+- **Warning:** a Finish with no enabled Rough above it in the list shows "⚠ no Rough op before this Finish". It would meet the full stock everywhere except the walls.
+
+Slopes and curves are finished in Z steps, so they are left with cusps up to the step height. Curved walls keep the 0.06 mm margin that roughing also keeps from them to cover the model mesh. Laps of the same wall on consecutive layers are joined by a short feed. Moves to another wall go up to the retract height, then come back down to one roughing layer above the lap (or to the Finish's Start Z without a Rough before it).
 
 ### Face
 
@@ -268,7 +246,7 @@ Plunges run at half the feed.
 
 ### Thread milling from the model
 
-Right-click a cylindrical hole and choose **Add to thread milling**. Ctrl+click several holes first to include them all. This adds a thread milling item with the same fields as a group on the Thread Milling tab, filled in from the model:
+Right-click a cylindrical hole and choose **Add to thread milling**. Ctrl+click several holes first to include them all. This adds a thread milling item to the operations list, filled in from the model:
 
 - **Locations:** the hole centres. They are re-taken when the model moves.
 - **Hole start Z:** the top of the hole.
@@ -278,6 +256,23 @@ Right-click a cylindrical hole and choose **Add to thread milling**. Ctrl+click 
   - through holes: the full depth.
 
 Holes with a different size, top or depth go into separate items.
+
+An item's fields:
+
+- **Thread:** M2, M2.5, M3, M4, M5 or M6.
+- **Hole start Z:** the top of the material at the holes. All hole geometry is below it.
+- **Thread length:** how deep the thread goes, from 0 to 100 mm.
+- **Descent angle:** the helix angle while boring.
+- **Milling cutter:** the end mill that bores the hole. Only cutters smaller than the tap-drill hole can be chosen.
+- **Locations:** one per line, as `x, y` or `X10 Y20`.
+
+How the holes are cut:
+
+- **Hole depth:** the thread length plus one pitch.
+- **Boring:** the hole is bored to the tap-drill Ø with a helix, in rings set by **Boring ring stepover** on Tools & Settings.
+- **Threading:** the thread mill goes to the bottom of the thread and climbs out with G3, so the thread stops one pitch above the bottom of the hole.
+- **Order:** an item's holes are all bored first, then all threaded. Boring visits the holes nearest-next, and threading runs the same route backwards, starting where boring ended.
+- **Speeds and feeds:** the thread milling spindle speed, boring feed and threading feed are set on Tools & Settings.
 
 **Thread mill all alike holes** (same menu) does this for every hole in the model with the same Ø, depth and blind or through type. Holes that already have a thread milling item are skipped.
 
@@ -307,8 +302,8 @@ The Simulator plays a program against the stock and shows the material being cut
 
 ### What to simulate
 
-- **Simulate:** **Step milling** or **Thread milling** (the current programs of those tabs), or a G-code file opened with **📂 Open G-code…**. Tools in a file are looked up in the tool table by number.
-- **Stock:** the step milling stock, or a box round the cutting moves. For thread milling the top of that box is the groups' Hole start Z. Tick **Custom stock** to type the box in yourself.
+- **Simulate:** **Step milling** (the current program) or a G-code file opened with **📂 Open G-code…**. Tools in a file are looked up in the tool table by number.
+- **Stock:** the step milling stock, or a box round the cutting moves for a file. Tick **Custom stock** to type the box in yourself.
 - **Detail:** how fine the simulated stock is: Low, Medium, High or Fine, with 150 to 800 cells along its longer side. Higher detail shows small features better but redraws more slowly.
 - **⟲ Restart:** starts again with fresh stock.
 
@@ -333,7 +328,7 @@ Times come from the run-time estimate, so the clock matches the estimated run ti
 
 - **Stock:** tan for uncut stock, bright for cut surfaces, dark where the tool has cut right through.
 - **Tool:** gold flutes and a grey shank, drawn at its current position.
-- **Path:** **All** shows the path done so far in colour and the rest faintly, **Done** shows only what has been cut, and **Off** hides it.
+- **Path:** **All** shows the path done so far in colour and the rest faintly, **Done** shows only what has been cut, and **Off** hides it. **Rapids**, **Milling** and **Threading** switch each kind of move on or off, in the same colours as the Step Milling view (threading is any feed move with a thread mill).
 - **G-code panel:** highlights the running line and scrolls with it while **Follow** is ticked. Click a line to run the simulation to the end of that line's move.
 - **Machine panel:** time, progress, line number, tool, rapid or feed, X Y Z, and material removed.
 
@@ -418,6 +413,7 @@ job.open()                               # look at it in stepCAM
 Each method takes a selection: a selector string applied to the part (such as `">Z"`), a Workplane, a Shape, or a list of them. They are added to the job in the order you call them.
 
 - `job.rough(**params)`
+- `job.finish(**params)`: wall finishing after roughing. `result.warnings` says if no `rough()` comes before it.
 - `job.face(faces=">Z", **params)`: one Face per flat, up-facing face.
 - `job.pocket(faces_or_edges, **params)`:
   - faces: flat or sloped faces that face up;
@@ -434,6 +430,7 @@ Every method also takes `enabled=False`, which adds the operation switched off.
 
 - **All operations:** `tool` (a tool number), `feed`, `speed`, `start_z`, `depth_per_pass`, `stepover` (%), `ramp_angle`, `strategy` (`"standard"` / `"adaptive"`), `entry` (`"helix"` / `"zigzag"` / `"plunge"`).
 - **Rough:** `layer_height`, `stock_to_leave`, `bottom_z`, `overcut_z`, `clear_voids`.
+- **Finish:** `z_step` (default 0.1), `stock_to_leave`, `bottom_z`.
 - **Face:** `extra` (past the outline).
 - **Pocket:** `finish` (the finish pass amount), `keep_islands`, `floor_z` (pockets made from edges).
 - **Profile:** `side` (`"outside"` / `"inside"` / `"center"`), `bottom_z`.
@@ -476,6 +473,8 @@ The module runs `stepcam batch spec.json`, which reads a JSON description of the
 
 ### Machining settings
 
+- **Thread milling: spindle speed, boring feed, threading feed:** for thread milling items. The boring feed is at the cutter centre. The threading feed is at the cutting edge, and the feed at the tool centre is reduced automatically.
+- **Thread milling: default descent angle:** the helix angle new thread milling items start with.
 - **Clearance above hole start Z (between holes):** how high the tool lifts between holes.
 - **Plunge feed.**
 - **Boring ring stepover (% of cutter Ø).**
@@ -500,7 +499,7 @@ Tool numbers must be unique across all three tables. Groups and operations follo
 - **Tool changes:** `M5 M9` stops the spindle and coolant, the tool goes up to the rapid plane, then comes `Tn M6 (description)`, `G43 Hn` if tool length comp is on, `Sxxxx M3`, and `M8` if coolant is on.
 - **End of program:** `M5`, `M9`, `M30`.
 - **Moves:** only G0, G1, G2 and G3 (arcs use I/J), so nearly any controller can run the program.
-- **Coordinates:** step milling programs are relative to the **G-code origin**. Thread milling programs use the coordinates you typed.
+- **Coordinates:** relative to the **G-code origin**.
 - **Comments** in brackets name each operation.
 
 **Estimated run time:** every move speeds up and slows down at the max acceleration, up to its feed or the rapid rate. Corners slow down as on a typical controller, so smooth paths keep their speed. Tool changes and spindle spin-up are not counted.

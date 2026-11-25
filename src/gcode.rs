@@ -10,8 +10,7 @@
 //! * Boring descends on a helix whose angle (at the tool-centre path) is
 //!   the group's descent angle.
 
-use crate::model::{Cutter, Job, Settings, ThreadGroup, ThreadMill, ThreadSize};
-use std::collections::BTreeMap;
+use crate::model::{Settings, ThreadGroup, ThreadMill};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Issue {
@@ -154,7 +153,6 @@ pub fn bore_rings(hole_dia: f64, tool_dia: f64, stepover_pct: f64) -> Vec<f64> {
 
 struct Writer {
     out: String,
-    current_tool: Option<u32>,
 }
 
 impl Writer {
@@ -162,28 +160,6 @@ impl Writer {
         // keep the program plain ASCII for controller compatibility
         self.out.push_str(&s.as_ref().replace('Ø', "D"));
         self.out.push('\n');
-    }
-
-    fn tool_change(&mut self, s: &Settings, tool: u32, desc: &str, rpm: f64) {
-        if self.current_tool == Some(tool) {
-            return;
-        }
-        self.line("");
-        if self.current_tool.is_some() {
-            self.line("M5");
-            self.line("M9");
-        }
-        self.line(format!("G0 Z{}", fmt(s.safe_z)));
-        self.line(format!("T{tool} M6 ({desc})"));
-        if s.tool_length_comp {
-            self.line(format!("G43 H{tool}"));
-        }
-        self.line(format!("S{} M3", rpm.round() as i64));
-        if s.coolant {
-            self.line("M8");
-        }
-        self.line(format!("G0 Z{}", fmt(s.safe_z)));
-        self.current_tool = Some(tool);
     }
 }
 
@@ -271,7 +247,7 @@ pub fn hole_order(locs: &[(f64, f64)]) -> Vec<(f64, f64)> {
 
 /// Helical boring of every location (no tool change), for other programs.
 pub fn bore_code(s: &Settings, g: &ThreadGroup, locs: &[(f64, f64)]) -> String {
-    let mut w = Writer { out: String::new(), current_tool: None };
+    let mut w = Writer { out: String::new() };
     for (x, y) in hole_order(locs) {
         bore_hole(&mut w, s, g, x, y);
     }
@@ -280,7 +256,7 @@ pub fn bore_code(s: &Settings, g: &ThreadGroup, locs: &[(f64, f64)]) -> String {
 
 /// Thread milling of every location (no tool change), for other programs.
 pub fn thread_code(s: &Settings, g: &ThreadGroup, locs: &[(f64, f64)]) -> String {
-    let mut w = Writer { out: String::new(), current_tool: None };
+    let mut w = Writer { out: String::new() };
     let tm = s.thread_mill(g.thread);
     for (x, y) in hole_order(locs).into_iter().rev() {
         thread_hole(&mut w, s, g, &tm, x, y);
@@ -288,108 +264,10 @@ pub fn thread_code(s: &Settings, g: &ThreadGroup, locs: &[(f64, f64)]) -> String
     w.out
 }
 
-/// Generate the full program. Returns the list of error messages if the job
-/// is invalid. Boring is done first (grouped by cutter), then threading
-/// (grouped by thread size), to minimise tool changes.
-pub fn generate(job: &Job) -> Result<String, Vec<String>> {
-    let s = &job.settings;
-    let mut errors: Vec<String> = validate_settings(s)
-        .into_iter()
-        .filter(|i| i.error)
-        .map(|i| format!("settings: {}", i.msg))
-        .collect();
-
-    let mut work: Vec<(usize, &ThreadGroup, Vec<(f64, f64)>)> = Vec::new();
-    for (i, g) in job.groups.iter().enumerate() {
-        for issue in validate_group(g, s).into_iter().filter(|i| i.error) {
-            errors.push(format!("group {}: {}", i + 1, issue.msg));
-        }
-        if let Ok(locs) = g.parse_locations() {
-            if !locs.is_empty() {
-                work.push((i, g, locs));
-            }
-        }
-    }
-    if work.is_empty() && errors.is_empty() {
-        errors.push("no groups with locations to machine".into());
-    }
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-
-    let mut w = Writer { out: String::new(), current_tool: None };
-    w.line("%");
-    w.line("(stepCAM - helical bore + thread mill)");
-    w.line("(units mm)");
-    // tool list
-    let mut cutters: BTreeMap<u32, Cutter> = BTreeMap::new();
-    let mut mills: BTreeMap<u32, ThreadSize> = BTreeMap::new();
-    for (_, g, _) in &work {
-        cutters.insert(g.cutter.tool_number(), g.cutter);
-        mills.insert(s.thread_mill(g.thread).tool, g.thread);
-    }
-    for (t, c) in &cutters {
-        w.line(format!("(T{t} endmill Ø{} flute {})", fmt(c.dia()), fmt(c.flute_len())));
-    }
-    for (t, th) in &mills {
-        let tm = s.thread_mill(*th);
-        w.line(format!("(T{t} thread mill {} Ø{} reach {})", th.name(), fmt(tm.dia), fmt(tm.reach)));
-    }
-    for (i, g, locs) in &work {
-        w.line(format!(
-            "(group {}: {} start Z{} length {} hole Ø{} depth {} cutter {} - {} holes)",
-            i + 1,
-            g.thread.name(),
-            fmt(g.start_z),
-            fmt(g.length),
-            fmt(g.thread.hole_dia()),
-            fmt(g.hole_depth()),
-            g.cutter.name(),
-            locs.len()
-        ));
-    }
-    w.line("G21 G90 G17 G94 G40 G49 G80");
-    w.line(format!("G0 Z{}", fmt(s.safe_z)));
-
-    // --- phase 1: helical boring, grouped by cutter
-    let mut bore_order: Vec<&(usize, &ThreadGroup, Vec<(f64, f64)>)> = work.iter().collect();
-    bore_order.sort_by_key(|(i, g, _)| (g.cutter.tool_number(), *i));
-    for (i, g, locs) in bore_order {
-        let t = g.cutter.tool_number();
-        w.tool_change(s, t, &format!("endmill Ø{}", fmt(g.cutter.dia())), s.spindle_rpm);
-        w.line(format!("(group {} - bore)", i + 1));
-        for (x, y) in hole_order(locs) {
-            bore_hole(&mut w, s, g, x, y);
-        }
-        w.line(format!("G0 Z{}", fmt(s.safe_z)));
-    }
-
-    // --- phase 2: thread milling, grouped by thread size
-    let mut thread_order: Vec<&(usize, &ThreadGroup, Vec<(f64, f64)>)> = work.iter().collect();
-    thread_order.sort_by_key(|(i, g, _)| (s.thread_mill(g.thread).tool, *i));
-    for (i, g, locs) in thread_order {
-        let t = s.thread_mill(g.thread).tool;
-        let tm = s.thread_mill(g.thread);
-        w.tool_change(s, t, &format!("thread mill {} Ø{}", g.thread.name(), fmt(tm.dia)), s.spindle_rpm);
-        w.line(format!("(group {} - thread)", i + 1));
-        for (x, y) in hole_order(locs).into_iter().rev() {
-            thread_hole(&mut w, s, g, &tm, x, y);
-        }
-        w.line(format!("G0 Z{}", fmt(s.safe_z)));
-    }
-
-    w.line("");
-    w.line("M5");
-    w.line("M9");
-    w.line(format!("G0 Z{}", fmt(s.safe_z)));
-    w.line("M30");
-    w.line("%");
-    Ok(w.out)
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::model::{Cutter, Job, ThreadSize};
 
     fn job_m3() -> Job {
         let mut job = Job::default();
@@ -402,6 +280,13 @@ mod tests {
             locations: "10, 20\n-5 7.5\n".into(),
         });
         job
+    }
+
+    /// The groups as thread milling items of a step milling program (the
+    /// old Thread Milling tab's program: bore every hole, then thread them).
+    pub(crate) fn generate(job: &Job) -> Result<String, Vec<String>> {
+        let ops = job.groups.iter().map(|g| crate::stepmill::StepOp { enabled: true, kind: crate::stepmill::OpKind::Thread(crate::stepmill::ThreadOp { faces: vec![], group: g.clone() }) }).collect();
+        crate::stepmill::generate(&crate::stepmill::StepJob { ops, ..Default::default() }, &job.settings)
     }
 
     fn z_values(code: &str) -> Vec<f64> {

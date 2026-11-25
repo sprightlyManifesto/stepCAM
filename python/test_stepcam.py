@@ -51,7 +51,7 @@ class StepCamTests(unittest.TestCase):
     def test_every_operation_from_selectors(self):
         part = plate()
         job = Job(part, stock=(4, 4, 1), settings={"coolant": False})
-        job.rough(tool=4, stock_to_leave=0.1, strategy="adaptive")
+        job.rough(tool=4, stock_to_leave=0.1, strategy="adaptive", finish_each_layer=True)
         job.face(">Z", tool=5, extra=0.5)
         job.pocket(part.faces(">Z[-2]"), tool=3, finish=0.1, entry="zigzag")
         job.pocket(part.faces(">Z[-2]").edges(), tool=2)  # same pocket from its edge loop
@@ -114,6 +114,20 @@ class StepCamTests(unittest.TestCase):
             bad = Job(part, origin_xy="middle")
             bad.profile("<Z")
             bad.generate(str(self.out / "b.nc"))
+
+    def test_finish_after_rough_and_the_warning_without(self):
+        part = plate()
+        job = Job(part, stock=(4, 4, 1))
+        job.rough(tool=4)
+        job.finish(tool=3, z_step=0.2)
+        res = job.generate(str(self.out / "f.nc"))
+        self.assertTrue(res.ops[1]["label"].startswith("Finish walls"), res.ops)
+        self.assertIn("0.2 mm steps", res.ops[1]["label"])
+        self.assertFalse(res.warnings, res.warnings)
+        job = Job(part, stock=(4, 4, 1))
+        job.finish()
+        res = job.generate(str(self.out / "g.nc"))
+        self.assertTrue(any("no Rough op before this Finish" in w for w in res.warnings), res.warnings)
 
     def test_errors_are_reported(self):
         part = plate()

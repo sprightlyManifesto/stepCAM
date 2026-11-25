@@ -58,7 +58,8 @@ _COMMON = {
     "ramp": "ramp_angle",
 }
 _ALIASES = {
-    "rough": {**_COMMON, "stock_to_leave": "allowance", "overcut": "overcut_z", "layer": "layer_height"},
+    "rough": {**_COMMON, "stock_to_leave": "allowance", "overcut": "overcut_z", "layer": "layer_height", "finish_each_layer": "finish_layers"},
+    "finish": {"stock_to_leave": "allowance", "z_step": "layer_height", "step": "layer_height"},
     "face": {**_COMMON, "extra": "overlap", "extra_past_outline": "overlap"},
     "pocket": {**_COMMON, "finish_allowance": "finish", "floor_z": "z", "bottom_z": "z", "islands": "keep_islands"},
     "profile": {**_COMMON, "bottom_z": "z"},
@@ -281,9 +282,21 @@ class Job:
 
         tool, layer_height, stepover (%), stock_to_leave, feed, speed,
         ramp_angle, entry ("helix" / "zigzag" / "plunge"), strategy
-        ("standard" / "adaptive"), start_z, bottom_z, overcut_z, clear_voids.
+        ("standard" / "adaptive"), start_z, bottom_z, overcut_z, clear_voids,
+        finish_each_layer (default True).
         """
         return self._add("rough", [], params, enabled=enabled)
+
+    def finish(self, *, enabled: bool = True, **params) -> "Job":
+        """Finish the part's walls after roughing (Finish on the Step Milling
+        tab): one climb-milled lap round every wall at each Z step, from the
+        part top down. Nothing else is cut, so add a rough() before it
+        (stepCAM warns otherwise: see Result.warnings).
+
+        tool, z_step (default 0.1 mm), stock_to_leave, feed, speed, start_z,
+        bottom_z.
+        """
+        return self._add("finish", [], params, enabled=enabled)
 
     def face(self, faces: Selection = ">Z", *, enabled: bool = True, **params) -> "Job":
         """Face down to each flat, up-facing face.
