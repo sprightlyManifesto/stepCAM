@@ -13,6 +13,9 @@
 //!   "stock": {"x": 4, "y": 4, "z": 2, "offset": true},      // optional
 //!   "placement": {"rot": [[..],[..],[..]], "offset": [..]},  // optional
 //!   "rapid_above": 10,                                       // optional
+//!   "origin": {"xy": "bottom_left", "z": "stock_top"},       // optional program zero:
+//!             // xy: model | center | bottom_left | bottom_right | top_left | top_right | custom
+//!             // z: model | stock_top | stock_base | custom; "at": [x, y, z] for custom axes
 //!   "settings_file": "stepcam-settings.json",                // optional
 //!   "settings": {"spindle_rpm": 12000, ...},                 // optional overrides
 //!   "ops": [ {"type": "rough" | "face" | "pocket" | "profile" | "engrave" |
@@ -41,6 +44,8 @@ struct Spec {
     placement: Option<step::Placement>,
     #[serde(default)]
     rapid_above: Option<f64>,
+    #[serde(default)]
+    origin: Option<stepmill::Origin>,
     #[serde(default)]
     settings_file: Option<String>,
     #[serde(default)]
@@ -166,6 +171,10 @@ fn run(spec: &Spec) -> (Value, i32) {
     }
     let stock = job.stock.bounds(model.min, model.max);
     let stock_top = stock.1[2];
+    if let Some(o) = spec.origin {
+        job.origin = o;
+    }
+    job.origin.resolve(stock.0, stock.1);
     let mut warnings: Vec<String> = job.stock.issues(model.min, model.max);
 
     let mut errors = vec![];
@@ -212,6 +221,7 @@ fn run(spec: &Spec) -> (Value, i32) {
         "run_time": secs,
         "run_time_text": estimate::format_time(secs),
         "stock": {"min": stock.0, "max": stock.1},
+        "origin": job.origin.at,
     });
     if let Some(p) = &spec.gcode_out {
         if let Err(e) = std::fs::write(p, &code) {
@@ -230,14 +240,17 @@ fn run(spec: &Spec) -> (Value, i32) {
         report["job"] = json!(p);
     }
     if let Some(s) = &spec.simulate {
-        report["simulation"] = simulate(&code, &gen_settings, stock, &model, s);
+        report["simulation"] = simulate(&code, &gen_settings, stock, &model, job.origin.at, s);
     }
     (report, 0)
 }
 
 /// Run the program through the simulator to the end.
-fn simulate(code: &str, s: &Settings, stock: ([f64; 3], [f64; 3]), model: &step::Model, spec: &SimSpec) -> Value {
-    let mut sm = sim::Sim::new(sim::Program::parse(code, s), stock.0, stock.1, spec.detail.clamp(20, 2000));
+fn simulate(code: &str, s: &Settings, stock: ([f64; 3], [f64; 3]), model: &step::Model, origin: [f64; 3], spec: &SimSpec) -> Value {
+    // the program is relative to the origin: simulate it where it cuts
+    let mut prog = sim::Program::parse(code, s);
+    prog.translate(origin);
+    let mut sm = sim::Sim::new(prog, stock.0, stock.1, spec.detail.clamp(20, 2000));
     while !sm.seek(f64::INFINITY, std::time::Duration::from_secs(3600)) {}
     let part = sm.map.surface_of(model.faces.iter().flat_map(|f| f.tris.iter()));
     let tol = spec.tolerance as f32;
@@ -684,6 +697,39 @@ mod tests {
             let s = &r["simulation"];
             assert_eq!(s["gouged_cells"], 0, "{entry}: {s}");
         }
+    }
+
+    #[test]
+    fn origin_moves_the_gcode_but_not_the_cut() {
+        let run_with = |origin: Value| {
+            let mut sp: Spec = serde_json::from_value(json!({
+                "step": "testdata/pocket_block.step", "stock": {"x": 4, "y": 4, "z": 1},
+                "origin": origin, "ops": [{"type": "rough"}], "simulate": {"detail": 150}
+            }))
+            .unwrap();
+            sp.gcode_out = None;
+            let (r, code) = run(&sp);
+            assert_eq!(code, 0, "{r:#}");
+            r
+        };
+        let plain = run_with(json!({}));
+        let moved = run_with(json!({"xy": "bottom_left", "z": "stock_top"}));
+        let (lo, hi) = (&moved["stock"]["min"], &moved["stock"]["max"]);
+        assert_eq!(moved["origin"], json!([lo[0], lo[1], hi[2]]));
+        assert_ne!(plain["gcode_text"], moved["gcode_text"]);
+        // the same program, relative to the origin: mapped back it matches
+        let tp0 = crate::toolpath::parse(plain["gcode_text"].as_str().unwrap());
+        let mut tp = crate::toolpath::parse(moved["gcode_text"].as_str().unwrap());
+        tp.translate([lo[0].as_f64().unwrap() as f32, lo[1].as_f64().unwrap() as f32, hi[2].as_f64().unwrap() as f32]);
+        for k in 0..3 {
+            assert!((tp.min[k] - tp0.min[k]).abs() < 1e-3 && (tp.max[k] - tp0.max[k]).abs() < 1e-3);
+        }
+        // the simulation (mapped back) is the same cut
+        let (a, b) = (&plain["simulation"], &moved["simulation"]);
+        assert!((a["removed_mm3"].as_f64().unwrap() - b["removed_mm3"].as_f64().unwrap()).abs() < 1e-6, "{a} vs {b}");
+        assert_eq!(b["gouged_cells"], 0);
+        let custom = run_with(json!({"xy": "custom", "z": "custom", "at": [1, 2, 3]}));
+        assert_eq!(custom["origin"], json!([1.0, 2.0, 3.0]));
     }
 
     #[test]

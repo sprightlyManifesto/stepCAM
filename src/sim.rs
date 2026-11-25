@@ -287,6 +287,26 @@ impl Program {
         p
     }
 
+    /// Move every piece by `d` (program -> model coordinates).
+    pub fn translate(&mut self, d: P3) {
+        if d == [0.0; 3] {
+            return;
+        }
+        let mv = |p: &mut P3| {
+            for k in 0..3 {
+                p[k] += d[k];
+            }
+        };
+        for pc in &mut self.pieces {
+            mv(&mut pc.a);
+            mv(&mut pc.b);
+        }
+        for b in [&mut self.bounds, &mut self.feed_bounds].into_iter().flatten() {
+            mv(&mut b.0);
+            mv(&mut b.1);
+        }
+    }
+
     /// Index of the piece running at time `t` and the fraction done of it.
     pub fn locate(&self, t: f64) -> (usize, f64) {
         if self.pieces.is_empty() || t <= 0.0 {

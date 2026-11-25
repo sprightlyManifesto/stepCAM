@@ -139,7 +139,10 @@ material, drawn as an orange wire box in the 3D view:
   values are added to the part's bounding box - X and Y split evenly over both
   sides, Z added on top.
 * **Offset** unticked: the values are the absolute stock size, centred on the
-  part in XY with its bottom level with the part bottom.
+  part in XY.
+* **Part in stock**: Bottom (default; part on the stock base, extra on top),
+  Middle (extra split above and below) or Top (part top at the stock top,
+  extra underneath). The stock box moves round the part; the part stays put.
 
 Toggling Offset converts the values so the stock itself does not change. The
 resulting size and stock top Z are shown next to the inputs, with a warning if
@@ -148,6 +151,17 @@ the stock is smaller than the part.
 Facing clears everything above its surface inside the part's outside profile, offset outwards by half the tool diameter (plus *Extra past outline*). New operations that cut from
 the top of the part start at the stock top, and operations whose Start Z is at
 the stock top follow it when the stock changes.
+
+## G-code origin (Step Milling)
+
+The **G-code origin** row sets program zero:
+- **XY:** Model 0, or the stock's centre, bottom left, bottom right, top left or top right.
+- **Z:** Model 0, stock top or stock base.
+- **X / Y / Z values:** typing one makes that axis Custom.
+
+Right-click a wall, a flat surface, a straight edge along X or Y, a vertical edge, or a vertical hole to put the origin there. Right-click the origin marker for the presets.
+
+Every X / Y / Z in the step milling G-code is written relative to the origin directly (no G10 / G53 / work offsets). The 3D views and the Simulator stay in model coordinates, and only the origin marker shows where it is.
 
 ## Rapid plane (Step Milling)
 

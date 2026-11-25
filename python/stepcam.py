@@ -96,8 +96,10 @@ class Result:
     gcode_path: Optional[str] = None
     job_path: Optional[str] = None
     step_path: Optional[str] = None
-    #: Stock box {"min": [x, y, z], "max": [x, y, z]}.
+    #: Stock box {"min": [x, y, z], "max": [x, y, z]} (model coordinates).
     stock: dict = field(default_factory=dict)
+    #: Program zero in model coordinates: the G-code is relative to it.
+    origin: list = field(default_factory=list)
     #: With simulate=: removed_mm3, at_size_pct, max_stock_left, max_gouge,
     #: gouged_cells, events (rapids through material, cuts deeper than the
     #: flutes) and warnings.
@@ -177,10 +179,19 @@ class Job:
     stock:          (x, y, z). With stock_offset=True (default) these are added
                     to the part's bounding box (X/Y split over both sides, Z on
                     top); with False they are the absolute stock size.
+    stock_z_anchor: where the part sits in the stock's height: "bottom"
+                    (default, part on the stock base, extra stock on top),
+                    "middle" or "top" (part top at the stock top).
     rapid_above:    rapid plane height above the stock or part top (mm).
     settings_file:  a settings JSON saved from the app (Tools & Settings tab).
     settings:       overrides, by field name, e.g. {"spindle_rpm": 12000,
                     "coolant": False, "max_accel": 300}.
+    origin_xy:      program X0 Y0: "model" (default, the part's own zero),
+                    "center", "bottom_left", "bottom_right", "top_left",
+                    "top_right" (of the stock, seen from above), or (x, y).
+    origin_z:       program Z0: "model" (default), "stock_top", "stock_base"
+                    or a Z value. The G-code is written relative to the origin
+                    directly (no G10 / G53 / work offsets).
     placement:      optional {"rot": 3x3, "offset": [x, y, z]} applied to the model.
     binary:         path of the stepcam program (see find_binary()).
     """
@@ -191,19 +202,32 @@ class Job:
         *,
         stock: Sequence[float] = (0.0, 0.0, 0.0),
         stock_offset: bool = True,
+        stock_z_anchor: str = "bottom",
         rapid_above: float = 10.0,
         settings_file: Optional[str] = None,
         settings: Optional[dict] = None,
+        origin_xy: Union[str, Sequence[float]] = "model",
+        origin_z: Union[str, float] = "model",
         placement: Optional[dict] = None,
         binary: Optional[str] = None,
     ):
         self.part = part
-        self.stock = {"x": float(stock[0]), "y": float(stock[1]), "z": float(stock[2]), "offset": bool(stock_offset)}
+        self.stock = {"x": float(stock[0]), "y": float(stock[1]), "z": float(stock[2]), "offset": bool(stock_offset), "z_anchor": stock_z_anchor}
         self.rapid_above = float(rapid_above)
         self.settings_file = settings_file
         self.settings = dict(settings or {})
         self.placement = placement
         self.binary = binary
+        at = [0.0, 0.0, 0.0]
+        if isinstance(origin_xy, str):
+            xy = origin_xy
+        else:
+            xy, at[0], at[1] = "custom", float(origin_xy[0]), float(origin_xy[1])
+        if isinstance(origin_z, str):
+            z = origin_z
+        else:
+            z, at[2] = "custom", float(origin_z)
+        self.origin = {"xy": xy, "z": z, "at": at}
         self.ops: list = []
         self.job_path: Optional[str] = None
 
@@ -341,6 +365,7 @@ class Job:
             s["settings"] = self.settings
         if self.placement:
             s["placement"] = self.placement
+        s["origin"] = self.origin
         if gcode:
             s["gcode_out"] = str(gcode)
         if job:
@@ -390,6 +415,7 @@ class Job:
             job_path=rep.get("job"),
             step_path=str(step_path),
             stock=rep.get("stock", {}),
+            origin=rep.get("origin", []),
             simulation=rep.get("simulation"),
             report=rep,
         )

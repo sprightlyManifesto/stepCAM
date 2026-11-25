@@ -38,6 +38,24 @@ impl Toolpath {
         self.by_line.get(line).map(|v| v.as_slice()).filter(|v| v.len() >= 2)
     }
 
+    /// Move everything by `d` (e.g. back from program to model coordinates).
+    pub fn translate(&mut self, d: [f32; 3]) {
+        if d == [0.0; 3] {
+            return;
+        }
+        let mv = |p: &mut [f32; 3]| {
+            for k in 0..3 {
+                p[k] += d[k];
+            }
+        };
+        self.paths.iter_mut().flat_map(|p| p.pts.iter_mut()).for_each(mv);
+        self.by_line.iter_mut().flatten().for_each(mv);
+        if !self.paths.is_empty() {
+            mv(&mut self.min);
+            mv(&mut self.max);
+        }
+    }
+
     fn push(&mut self, kind: MoveKind, from: [f64; 3], to: [f64; 3]) {
         let f = |p: [f64; 3]| [p[0] as f32, p[1] as f32, p[2] as f32];
         match self.paths.last_mut() {

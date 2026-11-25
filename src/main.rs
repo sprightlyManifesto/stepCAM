@@ -16,7 +16,7 @@ mod view3d;
 
 use eframe::egui;
 use model::{Cutter, Job, Settings, ThreadGroup, ThreadSize};
-use stepmill::{Entry, FaceOp, MillTab, OpKind, PocketOp, ProfileOp, ProfileSide, RoughOp, StepJob, StepOp, Strategy};
+use stepmill::{Entry, FaceOp, OriginXY, OriginZ, MillTab, OpKind, PocketOp, ProfileOp, ProfileSide, RoughOp, StepJob, StepOp, Strategy};
 use engrave::{EngraveOp, EngraveTool, HAlign, VAlign};
 use view3d::{ModelViz, Pick};
 
@@ -204,6 +204,7 @@ impl StepCamApp {
     /// ops that started at the old stock top start at the new one.
     fn sync_stock(&mut self) {
         let Some((smin, smax)) = self.stock_box() else { return };
+        self.job.step.origin.resolve(smin, smax);
         let region = [smin[0], smin[1], smax[0], smax[1]];
         let model = self.step_model.as_ref().unwrap();
         let part_bottom = model.min[2];
@@ -291,7 +292,10 @@ impl StepCamApp {
         let was_empty = self.step_toolpath.is_empty();
         match stepmill::generate(&self.job.step, &settings) {
             Ok(code) => {
+                // the program is relative to the origin: draw it where it cuts
                 self.step_toolpath = toolpath::parse(&code);
+                let o = self.job.step.origin.at;
+                self.step_toolpath.translate([o[0] as f32, o[1] as f32, o[2] as f32]);
                 self.step_gcode_time = estimate::estimate(&code, settings.rapid_rate, settings.max_accel);
                 self.step_gcode = code;
                 self.step_errors.clear();
@@ -390,6 +394,23 @@ impl StepCamApp {
                 self.apply_placement(moved, "Model laid flat on the surface (top at Z0)");
             }
             MenuAction::ResetPlacement => self.apply_placement(Default::default(), "Model placement reset to the STEP file coordinates"),
+            MenuAction::SetOrigin(x, y, z) => {
+                self.job.step.origin.set(x, y, z);
+                let at = self.job.step.origin.at;
+                self.set_status(format!("G-code origin at X{} Y{} Z{} (model coordinates)", gcode::fmt(at[0]), gcode::fmt(at[1]), gcode::fmt(at[2])), false);
+            }
+            MenuAction::OriginModes(xy, z) => {
+                let o = &mut self.job.step.origin;
+                if let Some(xy) = xy {
+                    o.xy = xy;
+                }
+                if let Some(z) = z {
+                    o.z = z;
+                }
+                if let Some((a, b)) = self.stock_box() {
+                    self.job.step.origin.resolve(a, b);
+                }
+            }
         }
     }
 
@@ -722,6 +743,7 @@ impl StepCamApp {
             }
         });
         self.stock_row(ui);
+        self.origin_row(ui);
         ui.weak("Click to highlight, right-click a flat surface or an edge to add operations. Esc clears the highlight.");
 
         egui::SidePanel::left("step_ops").resizable(true).default_width(340.0).min_width(260.0).show_inside(ui, |ui| {
@@ -741,7 +763,7 @@ impl StepCamApp {
             return;
         };
         let stock = self.job.step.stock.bounds(model.min, model.max);
-        let viz = ModelViz { model: &model, sel_edges: &self.sel.edges, sel_faces: &self.sel.faces, tabs: &tabs, stock: Some(stock) };
+        let viz = ModelViz { model: &model, sel_edges: &self.sel.edges, sel_faces: &self.sel.faces, tabs: &tabs, stock: Some(stock), origin: Some(self.job.step.origin.at) };
         let out = self.step_view.ui(ui, &self.step_toolpath, &[], Some(&viz));
         // Ctrl / Cmd + click adds cylindrical holes to the selection (or
         // removes them); right-clicking a selected hole keeps the selection
@@ -771,6 +793,7 @@ impl StepCamApp {
                 (_, Some(group)) => Selection { edges: vec![], faces: group },
                 (Some(Pick::Face(f)), None) => Selection { edges: vec![], faces: vec![*f] },
                 (Some(Pick::Edge { edge, .. }), _) => Selection { edges: model.edge_chain(*edge).0, faces: vec![] },
+                (Some(Pick::Origin), _) => std::mem::take(&mut self.sel),
                 (None, _) => Selection::default(),
             };
         }
@@ -787,10 +810,11 @@ impl StepCamApp {
         let click = self.menu_point;
         let reading = self.step_view.reading_angle();
         let settings = self.job.settings.clone();
+        let origin = self.job.step.origin;
         let mut action = None;
         let n_before = ops.len();
         out.response.context_menu(|ui| {
-            action = context_menu(ui, &model, &pick, ops, set_z, placed, stock_top, &sel_faces, &settings, click, reading);
+            action = context_menu(ui, &model, &pick, ops, set_z, placed, stock_top, &sel_faces, &settings, click, reading, &origin);
         });
         // new ops default to a 3.175 cutter: use the closest one in the tool table
         let bits = &self.job.settings.engravers;
@@ -856,13 +880,24 @@ impl StepCamApp {
                 st.y = was.y + sign * part[1];
                 st.z = was.z + sign * part[2];
             }
+            ui.label("Part in stock");
+            egui::ComboBox::from_id_salt("stock_z_anchor")
+                .selected_text(st.z_anchor.name())
+                .show_ui(ui, |ui| {
+                    for a in stepmill::ZAnchor::ALL {
+                        ui.selectable_value(&mut st.z_anchor, a, a.name());
+                    }
+                })
+                .response
+                .on_hover_text("Where the part sits in the stock's height: Top = part top at the stock top (extra stock below), Middle = extra split evenly, Bottom = part bottom on the stock base (extra stock on top)");
             if let Some((min, max)) = model_box {
                 let (a, b) = st.bounds(min, max);
                 ui.weak(format!(
-                    "= {} x {} x {}  (top Z{})",
+                    "= {} x {} x {}  (Z{} to Z{})",
                     gcode::fmt(b[0] - a[0]),
                     gcode::fmt(b[1] - a[1]),
                     gcode::fmt(b[2] - a[2]),
+                    gcode::fmt(a[2]),
                     gcode::fmt(b[2])
                 ));
                 for e in st.issues(min, max) {
@@ -870,6 +905,43 @@ impl StepCamApp {
                 }
             }
         });
+    }
+
+    /// Program zero for the step milling G-code.
+    fn origin_row(&mut self, ui: &mut egui::Ui) {
+        let stock = self.stock_box();
+        let o = &mut self.job.step.origin;
+        ui.horizontal(|ui| {
+            ui.label("G-code origin").on_hover_text(
+                "Program zero: every X / Y / Z in the step milling G-code is written relative to this point \
+                 (directly, no G10 / G53 / work offsets). The 3D views and the simulator stay in model coordinates.",
+            );
+            ui.label("XY");
+            egui::ComboBox::from_id_salt("origin_xy").selected_text(o.xy.name()).show_ui(ui, |ui| {
+                for m in OriginXY::ALL {
+                    ui.selectable_value(&mut o.xy, m, m.name());
+                }
+            });
+            ui.label("Z");
+            egui::ComboBox::from_id_salt("origin_z").selected_text(o.z.name()).show_ui(ui, |ui| {
+                for m in OriginZ::ALL {
+                    ui.selectable_value(&mut o.z, m, m.name());
+                }
+            });
+            ui.separator();
+            for (k, a) in ["X", "Y", "Z"].iter().enumerate() {
+                let mut v = o.at[k];
+                if ui.add(egui::DragValue::new(&mut v).speed(0.1).max_decimals(4).prefix(format!("{a} ")).suffix(" mm")).on_hover_text("Typing a value makes this axis Custom").changed() {
+                    let mut set = [None; 3];
+                    set[k] = Some(v);
+                    o.set(set[0], set[1], set[2]);
+                }
+            }
+            ui.weak("right-click a face, edge or hole (or the origin marker) to set it");
+        });
+        if let Some((a, b)) = stock {
+            o.resolve(a, b);
+        }
     }
 
     fn ops_list(&mut self, ui: &mut egui::Ui) {
@@ -1200,6 +1272,7 @@ impl eframe::App for StepCamApp {
                     settings: &self.job.settings,
                     model: self.step_model.as_ref(),
                     step_stock,
+                    step_origin: self.job.step.origin.at,
                     thread_top,
                 };
                 self.sim.ui(ui, &inp);
@@ -1214,6 +1287,10 @@ enum MenuAction {
     SetZ(usize, f64),
     LayFlat(usize),
     ResetPlacement,
+    /// Program zero at these coordinates (None = keep that axis).
+    SetOrigin(Option<f64>, Option<f64>, Option<f64>),
+    /// Program zero presets.
+    OriginModes(Option<OriginXY>, Option<OriginZ>),
 }
 
 /// XY outline and top Z of an edge chain; None if the chain is not level.
@@ -1691,6 +1768,7 @@ fn context_menu(
     settings: &Settings,
     click: Option<[f64; 3]>,
     reading_angle: f64,
+    origin: &stepmill::Origin,
 ) -> Option<MenuAction> {
     let mut action = None;
     // placement entries for any flat surface
@@ -1809,6 +1887,24 @@ fn context_menu(
             } else {
                 ui.weak("Curved surface - no operations");
             }
+            // program zero from this face: walls across X / Y, flat faces for Z, hole centres
+            let mut opts: Vec<(String, MenuAction)> = vec![];
+            if f.planar {
+                let n = f.normal;
+                if n[0].abs() > 1.0 - 1e-6 {
+                    opts.push((format!("Set origin X = {}", gcode::fmt(f.origin[0])), MenuAction::SetOrigin(Some(f.origin[0]), None, None)));
+                }
+                if n[1].abs() > 1.0 - 1e-6 {
+                    opts.push((format!("Set origin Y = {}", gcode::fmt(f.origin[1])), MenuAction::SetOrigin(None, Some(f.origin[1]), None)));
+                }
+                if n[2].abs() > 1.0 - 1e-6 {
+                    opts.push((format!("Set origin Z = {}", gcode::fmt(f.z())), MenuAction::SetOrigin(None, None, Some(f.z()))));
+                }
+            } else if let Some(c) = f.cyl.filter(|c| c.vertical()) {
+                let (x, y) = (c.origin[0], c.origin[1]);
+                opts.push((format!("Set origin X Y = centre (X{} Y{})", gcode::fmt(x), gcode::fmt(y)), MenuAction::SetOrigin(Some(x), Some(y), None)));
+            }
+            origin_items(ui, opts, &mut action);
             if f.planar {
                 placement_items(ui, *fi, &mut action, set_z);
             }
@@ -1847,6 +1943,37 @@ fn context_menu(
                 ops.push(StepOp { enabled: true, kind: OpKind::Tab(mill_tab(model, *edge, *point, *angle)) });
                 ui.close_menu();
             }
+            // program zero from a straight edge along an axis
+            let p = model.edges[*edge].pts[0];
+            let opts = match edge_axis(&model.edges[*edge]) {
+                Some(0) => vec![(format!("Set origin Y = {}", gcode::fmt(p[1])), MenuAction::SetOrigin(None, Some(p[1]), None))],
+                Some(1) => vec![(format!("Set origin X = {}", gcode::fmt(p[0])), MenuAction::SetOrigin(Some(p[0]), None, None))],
+                Some(_) => vec![(format!("Set origin X Y = this corner (X{} Y{})", gcode::fmt(p[0]), gcode::fmt(p[1])), MenuAction::SetOrigin(Some(p[0]), Some(p[1]), None))],
+                None => vec![],
+            };
+            origin_items(ui, opts, &mut action);
+        }
+        Some(Pick::Origin) => {
+            let a = origin.at;
+            ui.label(format!("G-code origin X{} Y{} Z{}", gcode::fmt(a[0]), gcode::fmt(a[1]), gcode::fmt(a[2])));
+            ui.separator();
+            ui.weak("X Y at");
+            for m in OriginXY::ALL.into_iter().filter(|m| *m != OriginXY::Custom) {
+                if ui.radio(origin.xy == m, m.name()).clicked() {
+                    action = Some(MenuAction::OriginModes(Some(m), None));
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+            ui.weak("Z at");
+            for m in OriginZ::ALL.into_iter().filter(|m| *m != OriginZ::Custom) {
+                if ui.radio(origin.z == m, m.name()).clicked() {
+                    action = Some(MenuAction::OriginModes(None, Some(m)));
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+            ui.weak("or right-click a face, edge or hole to put it there");
         }
         None => {
             ui.weak("Right-click a flat surface or an edge");
@@ -1854,6 +1981,41 @@ fn context_menu(
         }
     }
     action
+}
+
+/// "Set origin ..." entries of the right-click menu.
+fn origin_items(ui: &mut egui::Ui, opts: Vec<(String, MenuAction)>, action: &mut Option<MenuAction>) {
+    if opts.is_empty() {
+        return;
+    }
+    ui.separator();
+    for (label, a) in opts {
+        if ui.button(label).on_hover_text("Make this program zero for that axis: the step milling G-code is written relative to it").clicked() {
+            *action = Some(a);
+            ui.close_menu();
+        }
+    }
+}
+
+/// Axis (0 X, 1 Y, 2 Z) a straight edge runs along, if any.
+fn edge_axis(e: &step::Edge) -> Option<usize> {
+    let (a, b) = (e.pts.first()?, e.pts.last()?);
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if len < 1e-6 {
+        return None;
+    }
+    // straight: every point on the chord
+    let straight = e.pts.iter().all(|p| {
+        let v = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+        let t = (v[0] * d[0] + v[1] * d[1] + v[2] * d[2]) / (len * len);
+        let off = [v[0] - d[0] * t, v[1] - d[1] * t, v[2] - d[2] * t];
+        (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]).sqrt() < 1e-4
+    });
+    if !straight {
+        return None;
+    }
+    (0..3).find(|&k| d[k].abs() / len > 1.0 - 1e-6)
 }
 
 fn num(ui: &mut egui::Ui, label: &str, v: &mut f64, speed: f64, suffix: &str, hover: &str) {
@@ -2216,10 +2378,10 @@ mod rapid_tests {
         assert_eq!(app.job.step.rapid_above, 10.0);
         // part top Z0, stock = part
         assert!((app.step_settings().safe_z - 10.0).abs() < 1e-9);
-        app.job.step.stock = stepmill::Stock { x: 0.0, y: 0.0, z: 3.0, offset: true };
+        app.job.step.stock = stepmill::Stock { x: 0.0, y: 0.0, z: 3.0, offset: true, ..Default::default() };
         assert!((app.step_settings().safe_z - 13.0).abs() < 1e-9);
         // absolute stock thinner than the part: the part top counts
-        app.job.step.stock = stepmill::Stock { x: 60.0, y: 40.0, z: 5.0, offset: false };
+        app.job.step.stock = stepmill::Stock { x: 60.0, y: 40.0, z: 5.0, offset: false, ..Default::default() };
         app.job.step.rapid_above = 4.0;
         assert!((app.step_settings().safe_z - 4.0).abs() < 1e-9);
         // thread milling rapid plane is untouched
@@ -2407,5 +2569,52 @@ mod engrave_place_tests {
         // no click point: the surface centre
         let g = new_engrave(top, f, None, 0.0);
         assert!(g.x == 0.0 && g.y == 0.0);
+    }
+}
+
+#[cfg(test)]
+mod origin_pick_tests {
+    use super::*;
+
+    #[test]
+    fn straight_edges_report_their_axis() {
+        let m = step::parse_model(include_str!("../testdata/pocket_block.step")).unwrap();
+        let axes: Vec<Option<usize>> = m.edges.iter().map(edge_axis).collect();
+        for k in 0..3 {
+            assert!(axes.contains(&Some(k)), "no edge along axis {k}");
+        }
+        // the round hole's edges are not straight
+        assert!(axes.contains(&None));
+        let e = step::Edge { pts: vec![[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]], faces: vec![] };
+        assert_eq!(edge_axis(&e), None, "diagonal");
+        let bent = step::Edge { pts: vec![[0.0, 0.0, 0.0], [1.0, 0.1, 0.0], [2.0, 0.0, 0.0]], faces: vec![] };
+        assert_eq!(edge_axis(&bent), None, "not straight");
+    }
+
+    #[test]
+    fn origin_follows_the_stock_and_shifts_the_step_toolpath_back() {
+        let mut app = StepCamApp::default();
+        let m = step::parse_model(include_str!("../testdata/pocket_block.step")).unwrap();
+        app.step_model = Some(m.clone());
+        app.step_raw = Some(m);
+        app.add_rough_op();
+        app.regenerate_step_if_changed();
+        let plain = (app.step_toolpath.min, app.step_toolpath.max);
+        app.job.step.origin.xy = OriginXY::TopRight;
+        app.job.step.origin.z = OriginZ::StockBase;
+        app.regenerate_step_if_changed();
+        let (lo, hi) = app.stock_box().unwrap();
+        assert_eq!(app.job.step.origin.at, [hi[0], hi[1], lo[2]]);
+        // the G-code changed, the view did not
+        // the rapid plane is written relative to Z0 = stock base
+        assert!(app.step_gcode.contains(&format!("G0 Z{}", gcode::fmt(app.step_settings().safe_z - lo[2]))));
+        for k in 0..3 {
+            assert!((app.step_toolpath.min[k] - plain.0[k]).abs() < 1e-3 && (app.step_toolpath.max[k] - plain.1[k]).abs() < 1e-3);
+        }
+        app.menu_action(MenuAction::SetOrigin(Some(1.5), None, None));
+        assert_eq!(app.job.step.origin.xy, OriginXY::Custom);
+        assert_eq!(app.job.step.origin.at[0], 1.5);
+        app.menu_action(MenuAction::OriginModes(Some(OriginXY::Center), None));
+        assert_eq!(app.job.step.origin.at[0], (lo[0] + hi[0]) / 2.0);
     }
 }

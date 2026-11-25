@@ -27,6 +27,8 @@ pub struct ModelViz<'a> {
     pub tabs: &'a [MillTab],
     /// Stock box (min, max).
     pub stock: Option<([f64; 3], [f64; 3])>,
+    /// Program zero, drawn as a small triad (right-click it for its menu).
+    pub origin: Option<[f64; 3]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +36,8 @@ pub enum Pick {
     /// Edge index, picked 3D point, XY tangent angle (radians) at that point.
     Edge { edge: usize, point: [f64; 3], angle: f64 },
     Face(usize),
+    /// The program origin marker.
+    Origin,
 }
 
 pub struct ViewOut {
@@ -156,8 +160,8 @@ impl View3d {
         self.scale = (rect.width() / (2.0 * ex)).min(rect.height() / (2.0 * ez)) * 0.85;
     }
 
-    fn pick(&self, rect: Rect, m: &Model, pos: Pos2) -> Option<Pick> {
-        self.pick_at(rect, m, pos).0
+    fn pick(&self, rect: Rect, mv: &ModelViz, pos: Pos2) -> Option<Pick> {
+        self.pick_at(rect, mv, pos).0
     }
 
     /// Text direction (degrees, CCW from +X) that reads left to right in the
@@ -169,7 +173,14 @@ impl View3d {
     }
 
     /// What is under the cursor, and the 3D point there.
-    fn pick_at(&self, rect: Rect, m: &Model, pos: Pos2) -> (Option<Pick>, Option<[f64; 3]>) {
+    fn pick_at(&self, rect: Rect, mv: &ModelViz, pos: Pos2) -> (Option<Pick>, Option<[f64; 3]>) {
+        let m = mv.model;
+        // the origin marker wins within 8 px
+        if let Some(o) = mv.origin {
+            if (self.project(rect, f3(o)) - pos).length() < 8.0 {
+                return (Some(Pick::Origin), Some(o));
+            }
+        }
         // edges within 6 px win over faces
         let mut best: Option<(f32, usize, [f64; 3], f64)> = None;
         for (ei, e) in m.edges.iter().enumerate() {
@@ -316,6 +327,24 @@ impl View3d {
         }
     }
 
+    /// Program zero: X / Y / Z arrows of fixed screen length and a ringed dot.
+    pub(crate) fn draw_origin(&self, painter: &egui::Painter, rect: Rect, o: [f32; 3]) {
+        let len = 34.0 / self.scale.max(1e-6);
+        let c = self.project(rect, o);
+        for (axis, color, label) in [
+            ([1.0, 0.0, 0.0], Color32::from_rgb(235, 70, 70), "X"),
+            ([0.0, 1.0, 0.0], Color32::from_rgb(70, 205, 90), "Y"),
+            ([0.0, 0.0, 1.0], Color32::from_rgb(80, 140, 255), "Z"),
+        ] {
+            let tip = self.project(rect, [o[0] + axis[0] * len, o[1] + axis[1] * len, o[2] + axis[2] * len]);
+            painter.line_segment([c, tip], Stroke::new(4.0_f32, Color32::from_black_alpha(140)));
+            painter.line_segment([c, tip], Stroke::new(2.2_f32, color));
+            painter.text(tip + (tip - c).normalized() * 7.0, egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(11.0), color);
+        }
+        painter.circle(c, 5.0, Color32::from_rgb(255, 255, 255), Stroke::new(2.0_f32, Color32::from_rgb(20, 20, 20)));
+        painter.circle_filled(c, 2.0, Color32::from_rgb(20, 20, 20));
+    }
+
     fn draw_triad(&self, painter: &egui::Painter, rect: Rect) {
         // axis triad in the corner (directions only)
         let origin = rect.left_bottom() + Vec2::new(36.0, -36.0);
@@ -391,10 +420,10 @@ impl View3d {
         if let (Some(mv), true) = (model, self.show_model) {
             if let Some(pos) = resp.interact_pointer_pos() {
                 if resp.clicked() && !resp.double_clicked() {
-                    left_pick = Some(self.pick(rect, mv.model, pos));
+                    left_pick = Some(self.pick(rect, mv, pos));
                 }
                 if resp.secondary_clicked() {
-                    let (p, pt) = self.pick_at(rect, mv.model, pos);
+                    let (p, pt) = self.pick_at(rect, mv, pos);
                     right_pick = Some(p);
                     right_point = pt;
                 }
@@ -473,6 +502,10 @@ impl View3d {
                 let pts: Vec<Pos2> = p.pts.iter().map(|&q| self.project(rect, q)).collect();
                 painter.add(Shape::line(pts, stroke));
             }
+        }
+
+        if let Some(o) = model.and_then(|mv| mv.origin).filter(|_| self.show_model) {
+            self.draw_origin(&painter, rect, f3(o));
         }
 
         // move belonging to the G-code line under the cursor

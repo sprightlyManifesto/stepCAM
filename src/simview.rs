@@ -62,6 +62,9 @@ pub struct Inputs<'a> {
     pub step_stock: Option<(P3, P3)>,
     /// Highest thread group start Z (thread milling stock top).
     pub thread_top: Option<f64>,
+    /// Step milling program zero (model coordinates): the step program is
+    /// relative to it, so its moves are mapped back before simulating.
+    pub step_origin: P3,
 }
 
 /// Comparison with the model: worst gouge, cells gouged, most stock left.
@@ -107,6 +110,8 @@ pub struct SimTab {
     order: Option<((usize, usize, i32), Vec<u32>)>,
     compare_cache: Option<((u64, u64), Compare)>,
     status: String,
+    /// Program zero to draw (step milling only).
+    origin: Option<P3>,
 }
 
 impl Default for SimTab {
@@ -138,6 +143,7 @@ impl Default for SimTab {
             order: None,
             compare_cache: None,
             status: String::new(),
+            origin: None,
         }
     }
 }
@@ -222,9 +228,12 @@ impl SimTab {
     /// Rebuild the program / sim when what it depends on changed.
     fn sync(&mut self, inp: &Inputs) {
         let code = self.code(inp);
-        let pk = hash_of((self.source, code, format!("{:?}", inp.settings)));
+        let pk = hash_of((self.source, code, format!("{:?}", inp.settings), bits(inp.step_origin)));
         if pk != self.prog_key || self.sim.is_none() {
-            let prog = Program::parse(code, inp.settings);
+            let mut prog = Program::parse(code, inp.settings);
+            if self.source == Source::Step {
+                prog.translate(inp.step_origin);
+            }
             self.prog_key = pk;
             self.rebuild(inp, prog);
             return;
@@ -297,6 +306,7 @@ impl SimTab {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, inp: &Inputs) {
         self.sync(inp);
+        self.origin = (self.source == Source::Step).then_some(inp.step_origin);
         let total = self.sim.as_ref().map_or(0.0, |s| s.prog.total);
 
         // --- playback clock
@@ -640,7 +650,7 @@ impl SimTab {
         let order = &self.order.as_ref().unwrap().1;
         let part = if self.compare { self.part.as_deref() } else { None };
         let tol = self.tol as f32;
-        let (path, show_tool, show_stock) = (self.path, self.show_tool, self.show_stock);
+        let (path, show_tool, show_stock, origin) = (self.path, self.show_tool, self.show_stock, self.origin);
         let grid_z = m.bottom as f32;
         self.view.scene(ui, f3(lo), f3(hi), grid_z, |v, painter, rect| {
             if show_stock && m.nx > 2 {
@@ -648,6 +658,9 @@ impl SimTab {
             }
             if path != PathShow::Off {
                 draw_path(v, painter, rect, sim, path == PathShow::All);
+            }
+            if let Some(o) = origin {
+                v.draw_origin(painter, rect, f3(o));
             }
             if show_tool {
                 draw_tool(v, painter, rect, sim);
@@ -969,7 +982,7 @@ mod tests {
         let job = StepJob { ops: vec![StepOp { enabled: true, kind: OpKind::Rough(op) }], ..Default::default() };
         let s = Settings { safe_z: 25.0, ..Default::default() };
         let code = generate(&job, &s).unwrap();
-        let inp = Inputs { step_code: &code, thread_code: "", settings: &s, model: Some(&model), step_stock: Some(stock), thread_top: None };
+        let inp = Inputs { step_code: &code, thread_code: "", settings: &s, model: Some(&model), step_stock: Some(stock), thread_top: None, step_origin: [0.0; 3] };
         let ctx = egui::Context::default();
         let mut tab = SimTab::default();
         let mut frame = |tab: &mut SimTab| {

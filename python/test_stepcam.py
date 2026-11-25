@@ -93,6 +93,28 @@ class StepCamTests(unittest.TestCase):
             self.assertAlmostEqual(t["center"][1], 15.0)
             self.assertAlmostEqual(t["width"], 6.0)
 
+    def test_origin_presets_and_custom(self):
+        part = cq.Workplane().rect(40, 30).extrude(5)
+        job = Job(part, stock=(4, 4, 1), origin_xy="bottom_left", origin_z="stock_top")
+        job.profile("<Z", side="outside")
+        res = job.generate(str(self.out / "o.nc"))
+        self.assertEqual(res.origin, [res.stock["min"][0], res.stock["min"][1], res.stock["max"][2]])
+        self.assertEqual(res.origin, [-22.0, -17.0, 6.0])
+        # part 0..5 in 7 mm of stock: anchored at the top, 2 mm below it
+        job = Job(part, stock=(0, 0, 2), stock_z_anchor="top", origin_z="stock_base")
+        job.profile("<Z", side="outside")
+        res = job.generate(str(self.out / "a.nc"))
+        self.assertEqual((res.stock["min"][2], res.stock["max"][2]), (-2.0, 5.0))
+        self.assertEqual(res.origin[2], -2.0)
+        job = Job(part, origin_xy=(5, -3), origin_z=2.5)
+        job.profile("<Z", side="outside")
+        res = job.generate(str(self.out / "c.nc"))
+        self.assertEqual(res.origin, [5.0, -3.0, 2.5])
+        with self.assertRaises(StepCamError):
+            bad = Job(part, origin_xy="middle")
+            bad.profile("<Z")
+            bad.generate(str(self.out / "b.nc"))
+
     def test_errors_are_reported(self):
         part = plate()
         job = Job(part)

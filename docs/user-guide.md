@@ -141,7 +141,13 @@ The placement is saved in the job, and the operations follow the model:
 Set the raw material with the **Stock X / Y / Z** inputs. It is drawn as an orange wire box.
 
 - **Offset** ticked (the default): the values are added to the part's bounding box. X and Y are split over both sides and Z goes on top. All zeros means the stock is exactly the part's box.
-- **Offset** unticked: the values are the absolute stock size. The stock is centred on the part in XY, with its bottom level with the part bottom.
+- **Offset** unticked: the values are the absolute stock size, centred on the part in XY.
+- **Part in stock:** where the part sits in the stock's height.
+  - **Bottom** (the default): the part sits on the stock base, and the extra stock is on top, to be faced off.
+  - **Middle:** the extra is split evenly above and below.
+  - **Top:** the part's top is at the stock top, and the extra is underneath.
+
+  The part stays where it is in model coordinates and the stock box moves round it. With the G-code origin at the stock top or base, program zero moves with it.
 
 Switching Offset converts the numbers so the stock itself doesn't change. The resulting size and stock top are shown, with a warning if the stock is smaller than the part.
 
@@ -150,6 +156,30 @@ New operations that cut from the top start at the stock top, and follow it when 
 ### Rapid plane
 
 **Rapid plane height above stock or part** (default 10 mm) is added to the highest point of the stock or the part, whichever is higher. The resulting Z is shown next to the input. All rapids between cuts and all tool changes happen there.
+
+### G-code origin
+
+The **G-code origin** row sets program zero, the point that is X0 Y0 Z0 in the step milling G-code. Every X, Y and Z in the program is written relative to it. The offset is applied to the numbers directly: no G10, G53 or work-offset codes are used, so set your machine's work zero on the same point of the stock.
+
+- **XY:** **Model 0** (the model's own zero, the default) or a point of the stock seen from above: **Stock centre**, **Stock bottom left**, **Stock bottom right**, **Stock top left** or **Stock top right**. Bottom is −Y and left is −X.
+- **Z:** **Model 0** (the default), **Stock top** or **Stock base**.
+- **X / Y / Z:** where the origin is, in model coordinates. The stock presets follow the stock when it changes. Typing a value makes that axis **Custom**.
+
+You can also set it from the model by right-clicking:
+
+| Right-click | Menu entry | Sets |
+|---|---|---|
+| A flat wall facing ±X | **Set origin X** | X at the wall |
+| A flat wall facing ±Y | **Set origin Y** | Y at the wall |
+| A flat surface facing up or down | **Set origin Z** | Z at the surface |
+| A straight edge along X | **Set origin Y** | Y at the edge |
+| A straight edge along Y | **Set origin X** | X at the edge |
+| A vertical edge | **Set origin X Y = this corner** | X and Y at the corner |
+| A vertical hole or boss | **Set origin X Y = centre** | X and Y at its axis |
+
+Setting one axis from the model leaves the other where it was. For example, pick the front wall for Y and the left wall for X.
+
+The origin is drawn in the 3D view as a small X / Y / Z triad with a ringed dot. Right-click the dot for a menu of the presets. The 3D views and the Simulator always show the part, the stock and the toolpaths in model coordinates, so changing the origin moves only the marker and the numbers in the G-code.
 
 ### The operations list
 
@@ -370,10 +400,16 @@ job.open()                               # look at it in stepCAM
 
 ### The job
 
-`Job(part, stock=(x, y, z), stock_offset=True, rapid_above=10, settings_file=None, settings=None)`
+`Job(part, stock=(x, y, z), stock_offset=True, rapid_above=10, origin_xy="model", origin_z="model", settings_file=None, settings=None)`
 
 - **part:** a CadQuery Workplane or Shape, in machine coordinates. Move and rotate it in CadQuery to place it on the machine.
 - **stock:** with `stock_offset=True`, the values are added to the part's bounding box. With `False`, they are the absolute stock size. This is the same as the Stock inputs on the Step Milling tab.
+- **stock_z_anchor:** `"bottom"` (default), `"middle"` or `"top"`, the same as **Part in stock**.
+- **origin_xy / origin_z:** the G-code origin.
+  - `origin_xy`: `"model"`, `"center"`, `"bottom_left"`, `"bottom_right"`, `"top_left"`, `"top_right"`, or an `(x, y)` pair.
+  - `origin_z`: `"model"`, `"stock_top"`, `"stock_base"`, or a Z value.
+
+  `result.origin` gives where it ended up, in model coordinates.
 - **settings_file:** a settings file saved from Tools & Settings, holding your tool table.
 - **settings:** overrides by name, for example `{"spindle_rpm": 12000, "coolant": False}`.
 
@@ -464,6 +500,7 @@ Tool numbers must be unique across all three tables. Groups and operations follo
 - **Tool changes:** `M5 M9` stops the spindle and coolant, the tool goes up to the rapid plane, then comes `Tn M6 (description)`, `G43 Hn` if tool length comp is on, `Sxxxx M3`, and `M8` if coolant is on.
 - **End of program:** `M5`, `M9`, `M30`.
 - **Moves:** only G0, G1, G2 and G3 (arcs use I/J), so nearly any controller can run the program.
+- **Coordinates:** step milling programs are relative to the **G-code origin**. Thread milling programs use the coordinates you typed.
 - **Comments** in brackets name each operation.
 
 **Estimated run time:** every move speeds up and slows down at the max acceleration, up to its feed or the rapid rate. Corners slow down as on a typical controller, so smooth paths keep their speed. Tool changes and spindle spin-up are not counted.

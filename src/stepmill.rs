@@ -471,19 +471,173 @@ pub struct StepJob {
     pub stock: Stock,
     /// Rapid plane height above the stock or part top, whichever is higher.
     pub rapid_above: f64,
+    /// Program zero: every X / Y / Z in the G-code is relative to it.
+    pub origin: Origin,
     pub ops: Vec<StepOp>,
 }
 
 impl Default for StepJob {
     fn default() -> Self {
-        StepJob { step_path: String::new(), placement: Default::default(), stock: Default::default(), rapid_above: 10.0, ops: vec![] }
+        StepJob { step_path: String::new(), placement: Default::default(), stock: Default::default(), rapid_above: 10.0, origin: Default::default(), ops: vec![] }
     }
 }
 
+/// Where program X0 Y0 is: the model's own zero, a point of the stock box
+/// (seen from above: bottom = -Y, left = -X) or a typed / picked position.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginXY {
+    #[default]
+    Model,
+    Center,
+    BottomLeft,
+    BottomRight,
+    TopLeft,
+    TopRight,
+    Custom,
+}
+
+impl OriginXY {
+    pub const ALL: [OriginXY; 7] = [OriginXY::Model, OriginXY::Center, OriginXY::BottomLeft, OriginXY::BottomRight, OriginXY::TopLeft, OriginXY::TopRight, OriginXY::Custom];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            OriginXY::Model => "Model 0",
+            OriginXY::Center => "Stock centre",
+            OriginXY::BottomLeft => "Stock bottom left",
+            OriginXY::BottomRight => "Stock bottom right",
+            OriginXY::TopLeft => "Stock top left",
+            OriginXY::TopRight => "Stock top right",
+            OriginXY::Custom => "Custom",
+        }
+    }
+}
+
+/// Where program Z0 is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginZ {
+    #[default]
+    Model,
+    StockTop,
+    StockBase,
+    Custom,
+}
+
+impl OriginZ {
+    pub const ALL: [OriginZ; 4] = [OriginZ::Model, OriginZ::StockTop, OriginZ::StockBase, OriginZ::Custom];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            OriginZ::Model => "Model 0",
+            OriginZ::StockTop => "Stock top",
+            OriginZ::StockBase => "Stock base",
+            OriginZ::Custom => "Custom",
+        }
+    }
+}
+
+/// Program zero. `at` is where it sits in model (machine view) coordinates:
+/// the generated G-code is `at` subtracted from every position, written out
+/// directly (no G10 / G53 / work offsets). Presets follow the stock via
+/// `resolve`; Custom axes keep their value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Origin {
+    pub xy: OriginXY,
+    pub z: OriginZ,
+    pub at: P3,
+}
+
+impl Origin {
+    /// Update `at` for preset modes from the stock box.
+    pub fn resolve(&mut self, stock_min: P3, stock_max: P3) {
+        let (lo, hi) = (stock_min, stock_max);
+        let mid = |k: usize| (lo[k] + hi[k]) / 2.0;
+        let xy = match self.xy {
+            OriginXY::Model => Some([0.0, 0.0]),
+            OriginXY::Center => Some([mid(0), mid(1)]),
+            OriginXY::BottomLeft => Some([lo[0], lo[1]]),
+            OriginXY::BottomRight => Some([hi[0], lo[1]]),
+            OriginXY::TopLeft => Some([lo[0], hi[1]]),
+            OriginXY::TopRight => Some([hi[0], hi[1]]),
+            OriginXY::Custom => None,
+        };
+        if let Some([x, y]) = xy {
+            self.at[0] = x;
+            self.at[1] = y;
+        }
+        match self.z {
+            OriginZ::Model => self.at[2] = 0.0,
+            OriginZ::StockTop => self.at[2] = hi[2],
+            OriginZ::StockBase => self.at[2] = lo[2],
+            OriginZ::Custom => {}
+        }
+    }
+
+    /// Put program zero at these coordinates (None = leave that axis);
+    /// the axes set become Custom.
+    pub fn set(&mut self, x: Option<f64>, y: Option<f64>, z: Option<f64>) {
+        if x.is_some() || y.is_some() {
+            self.xy = OriginXY::Custom;
+        }
+        for (k, v) in [x, y, z].into_iter().enumerate() {
+            if let Some(v) = v {
+                self.at[k] = v;
+            }
+        }
+        if z.is_some() {
+            self.z = OriginZ::Custom;
+        }
+    }
+}
+
+/// Rewrite every X / Y / Z word (outside comments) as relative to `origin`.
+/// I / J are relative to the arc start already and stay as they are.
+pub fn shift_code(code: &str, origin: P3) -> String {
+    if origin == [0.0; 3] {
+        return code.to_string();
+    }
+    let mut out = String::with_capacity(code.len() + code.len() / 8);
+    for line in code.lines() {
+        // split off the comment: ( ... ) or ; ...
+        let cut = line.find(|c| c == '(' || c == ';').unwrap_or(line.len());
+        let (words, comment) = line.split_at(cut);
+        let mut first = true;
+        for w in words.split_whitespace() {
+            if !first {
+                out.push(' ');
+            }
+            first = false;
+            let mut ch = w.chars();
+            let k = match ch.next().map(|c| c.to_ascii_uppercase()) {
+                Some('X') => Some(0),
+                Some('Y') => Some(1),
+                Some('Z') => Some(2),
+                _ => None,
+            };
+            match (k, ch.as_str().parse::<f64>()) {
+                (Some(k), Ok(v)) => {
+                    out.push_str(&w[..1]);
+                    out.push_str(&fmt(v - origin[k]));
+                }
+                _ => out.push_str(w),
+            }
+        }
+        if !comment.is_empty() {
+            if !first {
+                out.push(' ');
+            }
+            out.push_str(comment);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Raw material block. With `offset` the X/Y/Z values are added to the part's
-/// bounding box (X/Y split evenly on both sides, Z all on top); without it
-/// they are the absolute stock size (centred on the part in XY, bottom level
-/// with the part bottom).
+/// bounding box (X/Y split evenly on both sides, Z as set by `z_anchor`);
+/// without it they are the absolute stock size, centred on the part in XY.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Stock {
@@ -491,11 +645,37 @@ pub struct Stock {
     pub y: f64,
     pub z: f64,
     pub offset: bool,
+    /// Where the part sits in the stock's height.
+    pub z_anchor: ZAnchor,
 }
 
 impl Default for Stock {
     fn default() -> Self {
-        Stock { x: 0.0, y: 0.0, z: 0.0, offset: true }
+        Stock { x: 0.0, y: 0.0, z: 0.0, offset: true, z_anchor: ZAnchor::Bottom }
+    }
+}
+
+/// Where the part sits in the stock's height: Top = part top at the stock
+/// top (extra stock below), Middle = extra split evenly, Bottom = part
+/// bottom on the stock base (extra stock on top).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZAnchor {
+    Top,
+    Middle,
+    #[default]
+    Bottom,
+}
+
+impl ZAnchor {
+    pub const ALL: [ZAnchor; 3] = [ZAnchor::Top, ZAnchor::Middle, ZAnchor::Bottom];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ZAnchor::Top => "Top",
+            ZAnchor::Middle => "Middle",
+            ZAnchor::Bottom => "Bottom",
+        }
     }
 }
 
@@ -505,7 +685,12 @@ impl Stock {
         let size = |k: usize, v: f64| if self.offset { max[k] - min[k] + v } else { v };
         let (sx, sy, sz) = (size(0, self.x), size(1, self.y), size(2, self.z));
         let c = [(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0];
-        ([c[0] - sx / 2.0, c[1] - sy / 2.0, min[2]], [c[0] + sx / 2.0, c[1] + sy / 2.0, min[2] + sz])
+        let z0 = match self.z_anchor {
+            ZAnchor::Bottom => min[2],
+            ZAnchor::Top => max[2] - sz,
+            ZAnchor::Middle => (min[2] + max[2]) / 2.0 - sz / 2.0,
+        };
+        ([c[0] - sx / 2.0, c[1] - sy / 2.0, z0], [c[0] + sx / 2.0, c[1] + sy / 2.0, z0 + sz])
     }
 
     /// Problems with the stock compared with the part.
@@ -2283,7 +2468,7 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
     w.line(format!("G0 Z{}", fmt(s.safe_z)));
     w.line("M30".into());
     w.line("%".into());
-    Ok(w.s)
+    Ok(shift_code(&w.s, job.origin.at))
 }
 
 /// Program text with tool / spindle state.
@@ -2339,6 +2524,7 @@ mod tests {
             step_path: String::new(),
             placement: Default::default(),
             stock: Default::default(),
+            origin: Default::default(),
             rapid_above: 10.0,
             ops: vec![StepOp {
                 enabled: true,
@@ -2425,6 +2611,7 @@ mod tests {
             step_path: String::new(),
             placement: Default::default(),
             stock: Default::default(),
+            origin: Default::default(),
             rapid_above: 10.0,
             ops: vec![StepOp {
                 enabled: true,
@@ -2493,7 +2680,7 @@ mod tests {
         assert!(closed);
         ops.push(StepOp { enabled: true, kind: OpKind::Tab(MillTab { center: [30.0, 10.0, -4.0], edges: chain, ..Default::default() }) });
         assert_eq!(ops.len(), 4); // face, 2 pockets, tab
-        let job = StepJob { step_path: "testdata/pocket_block.step".into(), placement: Default::default(), stock: Default::default(), rapid_above: 10.0, ops };
+        let job = StepJob { step_path: "testdata/pocket_block.step".into(), placement: Default::default(), stock: Default::default(), rapid_above: 10.0, origin: Default::default(), ops };
         let code = generate(&job, &Settings::default()).expect("valid program");
         let pts = feed_points(&code);
         // round hole (r=4 at 52,32) pocketed to -3 without touching its wall
@@ -2511,6 +2698,7 @@ mod tests {
             step_path: String::new(),
             placement: Default::default(),
             stock: Default::default(),
+            origin: Default::default(),
             rapid_above: 10.0,
             ops: vec![StepOp {
                 enabled: true,
@@ -2605,7 +2793,7 @@ mod rough_tests {
     #[test]
     fn roughing_clears_inside_and_a_band_outside() {
         let m = crate::step::parse_model(include_str!("../testdata/pocket_block.step")).unwrap();
-        let stock = Stock { x: 4.0, y: 4.0, z: 1.0, offset: true };
+        let stock = Stock { x: 4.0, y: 4.0, z: 1.0, offset: true, ..Default::default() };
         let (smin, smax) = stock.bounds(m.min, m.max);
         let op = RoughOp { allowance: 0.2,
             stock_region: [smin[0], smin[1], smax[0], smax[1]],
@@ -2853,12 +3041,12 @@ mod stock_tests {
     #[test]
     fn stock_offset_and_absolute() {
         let (min, max) = ([0.0, 0.0, -10.0], [60.0, 40.0, 0.0]);
-        let s = Stock { x: 4.0, y: 6.0, z: 2.0, offset: true };
+        let s = Stock { x: 4.0, y: 6.0, z: 2.0, offset: true, ..Default::default() };
         assert_eq!(s.bounds(min, max), ([-2.0, -3.0, -10.0], [62.0, 43.0, 2.0]));
         assert!(s.issues(min, max).is_empty());
-        let a = Stock { x: 70.0, y: 40.0, z: 12.0, offset: false };
+        let a = Stock { x: 70.0, y: 40.0, z: 12.0, offset: false, ..Default::default() };
         assert_eq!(a.bounds(min, max), ([-5.0, 0.0, -10.0], [65.0, 40.0, 2.0]));
-        let small = Stock { x: 50.0, y: 40.0, z: 12.0, offset: false };
+        let small = Stock { x: 50.0, y: 40.0, z: 12.0, offset: false, ..Default::default() };
         assert_eq!(small.issues(min, max).len(), 1);
         assert_eq!(Stock::default().bounds(min, max), (min, max));
     }
@@ -3451,3 +3639,88 @@ mod facing_outline_tests {
     }
 }
 
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    use crate::toolpath;
+
+    #[test]
+    fn presets_follow_the_stock_and_set_makes_custom() {
+        let (lo, hi) = ([-10.0, -5.0, 0.0], [30.0, 15.0, 8.0]);
+        let mut o = Origin::default();
+        o.resolve(lo, hi);
+        assert_eq!(o.at, [0.0; 3]);
+        for (xy, want) in [(OriginXY::Center, [10.0, 5.0]), (OriginXY::BottomLeft, [-10.0, -5.0]), (OriginXY::BottomRight, [30.0, -5.0]), (OriginXY::TopLeft, [-10.0, 15.0]), (OriginXY::TopRight, [30.0, 15.0])] {
+            o.xy = xy;
+            o.resolve(lo, hi);
+            assert_eq!([o.at[0], o.at[1]], want, "{xy:?}");
+        }
+        o.z = OriginZ::StockTop;
+        o.resolve(lo, hi);
+        assert_eq!(o.at[2], 8.0);
+        o.z = OriginZ::StockBase;
+        o.resolve(lo, hi);
+        assert_eq!(o.at[2], 0.0);
+        // picking an edge sets one axis, keeps the other where it was
+        o.set(Some(3.0), None, None);
+        assert_eq!((o.xy, o.at), (OriginXY::Custom, [3.0, 15.0, 0.0]));
+        o.resolve([0.0; 3], [1.0; 3]);
+        assert_eq!(o.at, [3.0, 15.0, 0.0], "custom stays put");
+    }
+
+    #[test]
+    fn shift_rewrites_positions_but_not_arcs_or_comments() {
+        let code = "G0 X10 Y-2.5 Z5 (op 1: Face to Z8)\nG3 X1 Y2 I-0.5 J0 F100\nT3 M6 (tool X1)\nG1 Z-1\n";
+        let s = shift_code(code, [10.0, -2.5, 8.0]);
+        assert_eq!(s, "G0 X0 Y0 Z-3 (op 1: Face to Z8)\nG3 X-9 Y4.5 I-0.5 J0 F100\nT3 M6 (tool X1)\nG1 Z-9\n");
+        assert_eq!(shift_code(code, [0.0; 3]), code);
+    }
+
+    #[test]
+    fn generated_program_moves_with_the_origin_and_maps_back() {
+        let pocket = PocketOp { z: -2.0, outer: vec![[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]], cutter: Cutter::C3x17, ..Default::default() };
+        let mut job = StepJob { ops: vec![StepOp { enabled: true, kind: OpKind::Pocket(pocket) }], ..Default::default() };
+        let s = Settings { safe_z: 10.0, ..Default::default() };
+        let plain = toolpath::parse(&generate(&job, &s).unwrap());
+        job.origin = Origin { xy: OriginXY::Custom, z: OriginZ::Custom, at: [5.0, -3.0, 1.5] };
+        let code = generate(&job, &s).unwrap();
+        assert!(code.contains("G0 Z8.5"), "rapid plane Z10 written relative to Z1.5");
+        let mut moved = toolpath::parse(&code);
+        assert!((moved.min[0] - (plain.min[0] - 5.0)).abs() < 1e-4);
+        moved.translate([5.0, -3.0, 1.5]);
+        for (a, b) in plain.paths.iter().zip(&moved.paths) {
+            for (p, q) in a.pts.iter().zip(&b.pts) {
+                for k in 0..3 {
+                    assert!((p[k] - q[k]).abs() < 1e-3, "{p:?} vs {q:?}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod z_anchor_tests {
+    use super::*;
+
+    #[test]
+    fn anchor_places_the_part_in_the_stock_height() {
+        // part Z 2..10, 4 mm extra stock
+        let (min, max) = ([0.0, 0.0, 2.0], [10.0, 10.0, 10.0]);
+        let z = |a: ZAnchor, offset: bool, v: f64| {
+            let (lo, hi) = Stock { x: 0.0, y: 0.0, z: v, offset, z_anchor: a }.bounds(min, max);
+            (lo[2], hi[2])
+        };
+        assert_eq!(z(ZAnchor::Bottom, true, 4.0), (2.0, 14.0));
+        assert_eq!(z(ZAnchor::Top, true, 4.0), (-2.0, 10.0));
+        assert_eq!(z(ZAnchor::Middle, true, 4.0), (0.0, 12.0));
+        // absolute size works the same way
+        assert_eq!(z(ZAnchor::Top, false, 12.0), (-2.0, 10.0));
+        assert_eq!(z(ZAnchor::Middle, false, 12.0), (0.0, 12.0));
+        // old jobs without the field keep the part on the stock base
+        let old: Stock = serde_json::from_str(r#"{"x": 1, "y": 1, "z": 3, "offset": true}"#).unwrap();
+        assert_eq!(old.z_anchor, ZAnchor::Bottom);
+        let s: Stock = serde_json::from_str(r#"{"z": 3, "z_anchor": "middle"}"#).unwrap();
+        assert_eq!(s.z_anchor, ZAnchor::Middle);
+    }
+}
