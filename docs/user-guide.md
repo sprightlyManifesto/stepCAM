@@ -163,7 +163,8 @@ Every operation has a **Tool** (from the tool table), **Feed** (mm/min) and **Sp
 
 - **Where it cuts:** each layer clears everything down to that height except the part. This covers pockets, holes, open steps such as the area above a flange, and a band round the part just wide enough for the cutter to run round its outside walls. The band is the part's outline seen from above, offset outwards by half the tool diameter. Stock further out, such as the corners of a square block round a round part, is left alone.
 - **Walls:** the part's walls are profiled at every layer.
-- **Stock facing:** if the stock is taller than the part, roughing first faces it down to the part top (plus stock to leave) over the same band. The row shows the Z range, or *none*.
+- **Order:** each area is cut all the way down before the next: the band round the outside through all its layers, then each pocket, step or hole in turn. A layer is cut only once the cuts above it are done. Going down an area, the tool stays on the floor it has just cleared: it feeds across to the next layer's start, or goes straight down where it stands, instead of lifting out. Moves to another area travel 0.5 mm above the deepest layer cleared all along the way, and go up to the retract height only when no layer is clear.
+- **Stock facing:** if the stock is taller than the part, roughing first faces it down to the part top (plus stock to leave) over the same band. The row shows the Z range, or *none*. **Facing** picks its pattern, as for the Face op (see Face below). Except with Spiral, a lap round the band's edge follows the facing.
 - **Slopes and curves:** sloped and curved surfaces (fillets, chamfers, domes) are followed. They are roughed down in steps, and the outline steps in and out with them.
 - **Layer height:** the spacing of the layers. Extra layers are added at every flat floor and at the top and foot of every sloped or curved surface, so each one is roughed to its depth.
 - **Stepover:** % of the cutter Ø between passes.
@@ -175,6 +176,8 @@ Every operation has a **Tool** (from the tool table), **Feed** (mm/min) and **Sp
   - **Narrow bands**, such as the one round the outside profile (an area with one island whose loops would be no wider than 1.6 × the standard 0.4 × tool Ø): one pass per layer down the middle of the band, each loop as wide as the band there. This replaces a ring of loops along each side. The advance is scaled so the cut on the longer outer side stays at the stepover.
   - **Wider areas:** rings of loops spaced 1.4 × tool Ø apart from the walls, because one loop as wide as the area would mostly cut air.
   - **Leftovers:** whatever the loops leave (along the middle of wide areas, square corners a band's loop can't reach) is cleared first with standard passes at 40 % stepover.
+- **Mixed** strategy: only the very outermost loop, round the band's outer edge against the uncut stock, is cut with adaptive clearing's trochoidal loops. Everything else is cut with standard offset passes at the stepover (default 40 %), first, inside out: the rest of the band round the outline, and the pockets, steps and cleared through holes inside the part. The outer loop's trochoids advance at half the stepover (20 %). The band is widened for the loops as with adaptive clearing. This avoids slotting the outer edge full width at a fraction of adaptive clearing's time.
+- **Inside only** (default off): no band round the outside profile, so the part's outside walls are not cut. Use it when the stock is already the part's size, or when the outside is cut by another operation. Everything inside the part's outline seen from above is still roughed: the stock above the part (faced over the outline only), pockets and holes, and fillets and chamfers on the outside edges. Along a fillet or chamfer the cutter runs up to one tool radius past the outline, so a band narrower than the tool is still cleared to the edge. Next to a vertical outside wall nothing is cut. Strips inside the outline narrower than 0.2 mm are left.
 - **Finish each layer** (default on): after clearing each layer, a climb-milled pass round the part's walls at tool radius + stock to leave. This cleans up the scallops that adaptive clearing leaves. The outer limit of the band is not a wall and is left out. Untick it to clear only.
 - **Entry:** **Helix**, **Zigzag** or **Plunge**. **Ramp angle** is the helix or zigzag angle.
 
@@ -189,17 +192,22 @@ Roughing sees the part from above, so undercuts can't be reached. Hops between c
 - **Tool, Feed, Speed.**
 - **Warning:** a Finish with no enabled Rough above it in the list shows "⚠ no Rough op before this Finish". It would meet the full stock everywhere except the walls.
 
-Slopes and curves are finished in Z steps, so they are left with cusps up to the step height. Curved walls keep the 0.06 mm margin that roughing also keeps from them to cover the model mesh. Laps of the same wall on consecutive layers are joined by a short feed. Moves to another wall go up to the retract height, then come back down to one roughing layer above the lap (or to the Finish's Start Z without a Rough before it).
+Slopes and curves are finished in Z steps, so they are left with cusps up to the step height. Curved walls keep the 0.06 mm margin that roughing also keeps from them to cover the model mesh. Each wall is finished all the way down before the next, and its laps on consecutive layers are joined by a short feed. Moves to another wall go up to the retract height, then come back down to one roughing layer above the lap (or to the Finish's Start Z without a Rough before it).
 
 ### Face
 
 Right-click a flat surface that faces up and choose **Face**. Facing mills everything above that surface flat, down to it, in **Depth per pass** steps. It only cuts inside the part's outside outline offset outwards by half the tool diameter, and not out to the whole stock.
 
+- **Pattern:** how the area is covered:
+  - **Unidirectional** (default): rows all cut in +X (climb), stepping towards −Y, lifting and coming back between rows.
+  - **Zigzag:** rows alternately +X and −X, stepping over at depth without lifting. Quicker, but every other row is conventional milling.
+  - **Spiral:** loops following the area's edge, from the outside in, stepping in at depth (climb). Anything the loops leave along the middle of narrow parts is cleared at the end with loops of its own.
+  - **Square spiral:** rectangles shrinking from the area's bounding box, outside in (climb), ending with a line down the middle. Where the area isn't rectangular, the rectangles are cut only where they fall inside it.
 - **Extra past outline:** goes this much further out (default 0).
-- **Stepover:** % of the cutter Ø between rows.
+- **Stepover:** % of the cutter Ø between rows or loops. The spirals use at most 70 %, so the inner corners of their loops are still covered.
 - **Start Z:** the top of the material, which follows the stock top.
 
-Rows run in +X (climb), stepping towards −Y. Where the outline splits a row in two, the tool only stays low between the pieces if it passes over ground already faced.
+Where the outline splits a row or loop, the tool only stays low between the pieces if it passes over ground already faced.
 
 ### Pocket
 
@@ -297,6 +305,16 @@ Right-click an edge and choose **Add mill tab**. This adds a rectangular tab sta
 - **Z height:** how far the tab stands up from the edge.
 
 Every cut lifts over the tab, allowing for the cutter radius, so the part stays attached to the stock. Tabs are drawn as green boxes.
+
+### Omit area
+
+Right-click any face of a pocket, hole or step (its floor, a wall, or a hole's wall) and choose **Omit area**. Every operation after the Omit op in the list then treats that area as filled in and leaves it uncut. Use it for features that are made another way, or later.
+
+- **What is filled:** the cavity round the clicked face, made of the faces reached from it without going below its lowest point or through a flat surface above it. It is filled up to the lowest of those flat surfaces round its top (the pocket's rim), and everything below, such as a hole in a counterbore's floor, goes with it. Clicking a counterbore's floor fills the counterbore; clicking the hole below it fills only the hole, up to the counterbore floor.
+- **The Omit op:** the first area makes an **Omit** op at the top of the list, and later ones are added to it. Each area is listed with its Z range and a 🗑 to stop omitting it, or right-click it again and choose **Stop omitting this area**. Move the op down the list to let the ops above it cut the area.
+- **In the 3D view** the omitted faces are tinted red-brown.
+- **How ops treat it:** roughing and finishing see solid material up to the fill's top; a pocket inside the area is skipped, and an area inside a pocket becomes an island; threaded holes inside it are left out. Any other cut that would reach into the area goes up over it at its top.
+- A face with no higher flat surface round it, such as the part's top, cannot be omitted.
 
 ## Simulator tab
 
@@ -424,6 +442,7 @@ Each method takes a selection: a selector string applied to the part (such as `"
 - `job.engrave(face, text, at=(x, y), **params)`: `at` is the anchor point in machine coordinates.
 - `job.thread(holes, **params)`: the selected cylindrical holes, as **Add to thread milling**.
 - `job.thread_alike(hole, **params)`: every hole like the selected one, as **Thread mill all alike holes**.
+- `job.omit(faces)`: **Omit area** for each selected face. The ops added after it treat those areas as filled in.
 - `job.tabs(edges, at=0.5, **params)`: a mill tab on each selected edge, at the fraction `at` along it. Give a list, such as `at=(0.25, 0.75)`, for several tabs per edge.
 
 Every method also takes `enabled=False`, which adds the operation switched off.
@@ -460,7 +479,7 @@ It returns a result with:
 
 With `simulate=True` (or `{"detail": 300, "tolerance": 0.02}`) the program also runs through the simulator, and `result.simulation` gives:
 - `removed_mm3` and `at_size_pct`;
-- `max_stock_left`, `max_gouge`, `max_gouge_at` and `gouged_cells`;
+- `max_stock_left` and `max_stock_left_at` (where, as [x, y, z of the cut surface]), `max_gouge`, `max_gouge_at` and `gouged_cells`;
 - `events`: rapids through material and cuts deeper than the flutes, each with its line number.
 
 Threads and engraving count as gouges here, because the model has neither.
@@ -484,6 +503,10 @@ The module runs `stepcam batch spec.json`, which reads a JSON description of the
 - **Rapid rate G0 (run-time estimate):** default 3000 mm/min.
 - **Coolant (M8):** coolant on during cutting.
 - **Tool length comp (G43 Hn):** adds `G43 Hn` after each tool change.
+- **Face pattern:** the facing pattern new Face ops start with, and new Rough ops' stock facing (Unidirectional by default).
+- **Rough strategy:** the strategy new Rough ops start with (Standard by default), with its default stepover: 20 % for adaptive clearing, else 40 %.
+
+Both apply to ops added afterwards. Existing ops keep their own choice. In batch and Python they are the `face_pattern` and `rough_strategy` settings.
 
 ### Tool tables
 

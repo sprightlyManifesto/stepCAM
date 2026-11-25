@@ -282,8 +282,12 @@ class Job:
 
         tool, layer_height, stepover (%), stock_to_leave, feed, speed,
         ramp_angle, entry ("helix" / "zigzag" / "plunge"), strategy
-        ("standard" / "adaptive"), start_z, bottom_z, overcut_z, clear_voids,
-        finish_each_layer (default True).
+        ("standard" / "adaptive" / "mixed": trochoids only on the outermost
+        loop, standard passes elsewhere), start_z, bottom_z, overcut_z, clear_voids,
+        facing (pattern of the stock facing: "unidirectional" / "zigzag" /
+        "spiral" / "square_spiral"), finish_each_layer (default True), inside_only (default False: no cut
+        round the outside profile; the top and outside-edge fillets and
+        chamfers are still cleared).
         """
         return self._add("rough", [], params, enabled=enabled)
 
@@ -302,7 +306,8 @@ class Job:
         """Face down to each flat, up-facing face.
 
         tool, stepover (%), depth_per_pass, extra (past the outline + tool
-        radius), feed, speed, start_z.
+        radius), feed, speed, start_z, pattern ("unidirectional" / "zigzag" /
+        "spiral" / "square_spiral").
         """
         return self._add("face", [_face_pick(f) for f in self._faces(faces)], params, enabled=enabled)
 
@@ -357,6 +362,15 @@ class Job:
         """Thread mill every hole in the model like the selected one (same Ø,
         depth and blind / through type), skipping holes already threaded."""
         return self._add("thread_alike", [_face_pick(f) for f in self._faces(hole)], params, enabled=enabled)
+
+    def omit(self, faces: Selection, *, enabled: bool = True) -> "Job":
+        """Omit areas (Omit area on the right-click menu): each selected face's
+        pocket, hole or step is treated as filled in, up to the lowest flat
+        surface round its top, by every op added after this one.
+
+        Pick any face of the area: its floor, a wall, or a hole's wall.
+        """
+        return self._add("omit", [_face_pick(f) for f in self._faces(faces)], {}, enabled=enabled)
 
     def tabs(self, edges: Selection, *, at: Union[float, Sequence[float]] = 0.5, enabled: bool = True, **params) -> "Job":
         """Mill tabs on each selected edge, at fraction(s) `at` along it

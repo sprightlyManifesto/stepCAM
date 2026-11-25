@@ -139,6 +139,28 @@ class StepCamTests(unittest.TestCase):
         ops = [o["kind"]["Rough"] for o in json.loads(Path(res.job_path).read_text())["step"]["ops"]]
         self.assertEqual([o["stepover_pct"] for o in ops], [20.0, 30.0, 40.0])
 
+    def test_omit_fills_the_pocket_and_holes(self):
+        part = plate()
+        job = Job(part, stock=(4, 4, 1))
+        job.omit(part.faces(cq.selectors.NearestToPointSelector((0, 0, 5))))
+        job.omit(part.faces("%CYLINDER"))
+        job.rough()
+        res = job.generate(str(self.out / "o.nc"))
+        self.assertEqual([o["label"] for o in res.ops[:2]], ["Omit 1 area", "Omit 2 areas"])
+        ops = json.loads(Path(res.job_path).read_text())["step"]["ops"]
+        fills = [f for o in ops[:2] for f in o["kind"]["Omit"]["fills"]]
+        self.assertEqual([(round(f["bottom"], 3), round(f["top"], 3)) for f in fills], [(5.0, 8.0), (3.0, 8.0), (3.0, 8.0)])
+
+    def test_facing_patterns(self):
+        part = plate()
+        job = Job(part, stock=(4, 4, 2))
+        job.face(pattern="square_spiral")
+        job.rough(facing="zigzag")
+        res = job.generate(str(self.out / "p.nc"))
+        ops = json.loads(Path(res.job_path).read_text())["step"]["ops"]
+        self.assertEqual(ops[0]["kind"]["Face"]["pattern"], "SquareSpiral")
+        self.assertEqual(ops[1]["kind"]["Rough"]["facing"], "Zigzag")
+
     def test_errors_are_reported(self):
         part = plate()
         job = Job(part)

@@ -15,6 +15,8 @@ pub struct ModelViz<'a> {
     pub model: &'a Model,
     pub sel_edges: &'a [usize],
     pub sel_faces: &'a [usize],
+    /// Faces of omitted areas (shown tinted).
+    pub omit_faces: &'a [usize],
     pub tabs: &'a [MillTab],
     /// Stock box (min, max).
     pub stock: Option<([f64; 3], [f64; 3])>,
@@ -83,6 +85,8 @@ pub(crate) const RAPID: Color32 = Color32::from_rgba_premultiplied(150, 50, 50, 
 pub(crate) const BORE: Color32 = Color32::from_rgb(70, 150, 255);
 pub(crate) const THREAD: Color32 = Color32::from_rgb(255, 165, 40);
 const SELECT: Color32 = Color32::from_rgb(255, 220, 0);
+/// Omitted areas.
+const OMIT: Color32 = Color32::from_rgb(205, 120, 95);
 const TAB: Color32 = Color32::from_rgb(60, 200, 90);
 
 fn f3(p: [f64; 3]) -> [f32; 3] {
@@ -486,6 +490,8 @@ impl View3d {
             let selected = mv.sel_faces.contains(&fi);
             let base = if selected {
                 SELECT
+            } else if mv.omit_faces.contains(&fi) {
+                OMIT
             } else if f.is_up_horizontal() {
                 Color32::from_rgb(150, 165, 185)
             } else {

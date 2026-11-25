@@ -195,7 +195,7 @@ impl StepCamApp {
                         OpKind::Pocket(p) => &mut p.start_z,
                         OpKind::Profile(p) => &mut p.start_z,
                         OpKind::Rough(r) => &mut r.start_z,
-                        OpKind::Finish(_) | OpKind::Tab(_) | OpKind::Engrave(_) | OpKind::Thread(_) => continue,
+                        OpKind::Finish(_) | OpKind::Tab(_) | OpKind::Engrave(_) | OpKind::Thread(_) | OpKind::Omit(_) => continue,
                     };
                     if (*start - old).abs() < 1e-6 {
                         *start = smax[2];
@@ -224,6 +224,7 @@ impl StepCamApp {
                     OpKind::Tab(t) => Some(t.top()),
                     OpKind::Engrave(g) => Some(g.z),
                     OpKind::Thread(t) => Some(t.group.start_z),
+                    OpKind::Omit(_) => None,
                 })
                 .fold(0.0, f64::max),
         }
@@ -507,7 +508,8 @@ impl StepCamApp {
             return;
         };
         let stock = self.job.step.stock.bounds(model.min, model.max);
-        let viz = ModelViz { model: &model, sel_edges: &self.sel.edges, sel_faces: &self.sel.faces, tabs: &tabs, stock: Some(stock), origin: Some(self.job.step.origin.at) };
+        let omit_faces: Vec<usize> = self.job.step.ops.iter().filter(|o| o.enabled && matches!(o.kind, OpKind::Omit(_))).flat_map(|o| o.faces()).collect();
+        let viz = ModelViz { model: &model, sel_edges: &self.sel.edges, sel_faces: &self.sel.faces, omit_faces: &omit_faces, tabs: &tabs, stock: Some(stock), origin: Some(self.job.step.origin.at) };
         let out = self.step_view.ui(ui, &self.step_toolpath, Some(&viz));
         // Ctrl / Cmd + click adds cylindrical holes to the selection (or
         // removes them); right-clicking a selected hole keeps the selection
@@ -831,6 +833,21 @@ impl StepCamApp {
                 ui.end_row();
                 ui.label("Tool length comp (G43 Hn)");
                 ui.checkbox(&mut s.tool_length_comp, "");
+                ui.end_row();
+                // step milling defaults for new ops
+                ui.label("Face pattern (new Face ops, roughing's stock facing)");
+                egui::ComboBox::from_id_salt("default_face_pattern").selected_text(s.face_pattern.name()).show_ui(ui, |ui| {
+                    for k in stepmill::FacingPattern::ALL {
+                        ui.selectable_value(&mut s.face_pattern, k, k.name()).on_hover_text(k.hover());
+                    }
+                });
+                ui.end_row();
+                ui.label("Rough strategy (new Rough ops)");
+                egui::ComboBox::from_id_salt("default_rough_strategy").selected_text(strategy_name(s.rough_strategy)).show_ui(ui, |ui| {
+                    for k in [Strategy::Standard, Strategy::Adaptive, Strategy::Mixed] {
+                        ui.selectable_value(&mut s.rough_strategy, k, strategy_name(k));
+                    }
+                });
                 ui.end_row();
             });
             for is in gcode::validate_settings(s) {
@@ -1387,6 +1404,15 @@ fn refresh_ops(ops: &mut [StepOp], model: &step::Model, old: &step::Placement, n
                 }
                 None => ok = false,
             },
+            // the areas follow their faces
+            OpKind::Omit(m) => {
+                for f in &mut m.fills {
+                    match stepmill::omit_fill(model, f.face) {
+                        Ok(n) => *f = n,
+                        Err(_) => ok = false,
+                    }
+                }
+            }
             OpKind::Tab(t) => {
                 t.center = new.point(old.inv_point(t.center));
                 let d = new.dir(old.inv_dir([t.angle.cos(), t.angle.sin(), 0.0]));
@@ -1406,6 +1432,8 @@ fn refresh_ops(ops: &mut [StepOp], model: &step::Model, old: &step::Placement, n
                     "its edges are no longer level"
                 } else if matches!(op.kind, OpKind::Thread(_)) {
                     "its holes are no longer vertical"
+                } else if matches!(op.kind, OpKind::Omit(_)) {
+                    "an omitted area can no longer be filled in from above"
                 } else if matches!(op.kind, OpKind::Pocket(_)) {
                     "its surface is now vertical or faces down"
                 } else {
@@ -1429,9 +1457,10 @@ fn from_top(model: &step::Model, stock_top: f64, start: f64) -> f64 {
 }
 
 /// Face op down to flat surface `fi`.
-fn face_op(model: &step::Model, fi: usize, stock_top: f64) -> FaceOp {
+fn face_op(model: &step::Model, fi: usize, stock_top: f64, settings: &Settings) -> FaceOp {
     let z = model.faces[fi].z();
     FaceOp {
+        pattern: settings.face_pattern,
         face_id: fi,
         z,
         region: [model.min[0], model.min[1], model.max[0], model.max[1]],
@@ -1518,8 +1547,12 @@ fn rough_op(model: &step::Model, stock: ([f64; 3], [f64; 3]), settings: &Setting
         start_z: smax[2],
         bottom_z: model.min[2],
         faces: stepmill::rough_faces(model),
+        strategy: settings.rough_strategy,
+        facing: settings.face_pattern,
         ..Default::default()
     };
+    // (the strategy's own default stepover)
+    op.stepover_pct = stepmill::stepover_for(stepmill::Strategy::Standard, op.strategy, op.stepover_pct);
     let table = &settings.cutters;
     if !table.iter().any(|t| t.id == op.cutter.id) {
         if let Some(&best) = table.iter().min_by(|a, b| (a.dia - op.cutter.dia).abs().total_cmp(&(b.dia - op.cutter.dia).abs())) {
@@ -1543,9 +1576,53 @@ fn finish_insert_at(ops: &[StepOp]) -> usize {
     ops.iter().rposition(|o| matches!(o.kind, OpKind::Rough(_) | OpKind::Finish(_))).map_or_else(|| rough_insert_at(ops), |k| k + 1)
 }
 
+/// "Omit area" (or "Stop omitting") for face `fi`.
+fn omit_items(ui: &mut egui::Ui, model: &step::Model, fi: usize, ops: &mut Vec<StepOp>) {
+    ui.separator();
+    let owner = ops.iter().position(|o| matches!(&o.kind, OpKind::Omit(m) if m.fills.iter().any(|f| f.faces.contains(&fi))));
+    if let Some(oi) = owner {
+        if ui.button("Stop omitting this area").on_hover_text(format!("Take it out of op {}", oi + 1)).clicked() {
+            if let OpKind::Omit(m) = &mut ops[oi].kind {
+                m.fills.retain(|f| !f.faces.contains(&fi));
+            }
+            ui.close_menu();
+        }
+        return;
+    }
+    let fill = stepmill::omit_fill(model, fi);
+    let hover = match &fill {
+        Ok(f) => format!(
+            "The ops after the Omit op treat this pocket / hole / step as filled in, from Z{} up to Z{} (the lowest surface round its top), and leave it uncut",
+            gcode::fmt(f.bottom),
+            gcode::fmt(f.top)
+        ),
+        Err(_) => String::new(),
+    };
+    if ui
+        .add_enabled(fill.is_ok(), egui::Button::new("Omit area"))
+        .on_hover_text(hover)
+        .on_disabled_hover_text(fill.as_ref().err().cloned().unwrap_or_default())
+        .clicked()
+    {
+        if let Ok(f) = fill {
+            add_omit(ops, f);
+        }
+        ui.close_menu();
+    }
+}
+
+/// Add an area to the last Omit op, or to a new one at the top of the list
+/// (so every op after it treats the area as filled in).
+fn add_omit(ops: &mut Vec<StepOp>, f: stepmill::Fill) {
+    match ops.iter_mut().rev().find_map(|o| if let OpKind::Omit(m) = &mut o.kind { Some(m) } else { None }) {
+        Some(m) => m.fills.push(f),
+        None => ops.insert(0, StepOp { enabled: true, kind: OpKind::Omit(stepmill::OmitOp { fills: vec![f] }) }),
+    }
+}
+
 /// Where a new roughing op goes: before the other cutting ops.
 fn rough_insert_at(ops: &[StepOp]) -> usize {
-    ops.iter().position(|o| !matches!(o.kind, OpKind::Tab(_) | OpKind::Rough(_))).unwrap_or(ops.len())
+    ops.iter().position(|o| !matches!(o.kind, OpKind::Tab(_) | OpKind::Omit(_) | OpKind::Rough(_))).unwrap_or(ops.len())
 }
 
 fn context_menu(
@@ -1601,7 +1678,7 @@ fn context_menu(
                 ui.label(format!("Flat surface at Z{}", gcode::fmt(f.z())));
                 ui.separator();
                 if ui.button("Face").on_hover_text("Mill the whole part down to this surface").clicked() {
-                    ops.push(StepOp { enabled: true, kind: OpKind::Face(face_op(model, *fi, stock_top)) });
+                    ops.push(StepOp { enabled: true, kind: OpKind::Face(face_op(model, *fi, stock_top, settings)) });
                     ui.close_menu();
                 }
                 if ui.button("Pocket").on_hover_text("Clear the material inside this surface's outer boundary down to it").clicked() {
@@ -1679,6 +1756,7 @@ fn context_menu(
             } else {
                 ui.weak("Curved surface - no operations");
             }
+            omit_items(ui, model, *fi, ops);
             // program zero from this face: walls across X / Y, flat faces for Z, hole centres
             let mut opts: Vec<(String, MenuAction)> = vec![];
             if f.planar {
@@ -1829,11 +1907,31 @@ fn cutter_combo(ui: &mut egui::Ui, i: usize, c: &mut Cutter, cutters: &[Cutter])
     ui.end_row();
 }
 
+fn strategy_name(s: Strategy) -> &'static str {
+    match s {
+        Strategy::Standard => "Standard",
+        Strategy::Adaptive => "Adaptive clearing",
+        Strategy::Mixed => "Mixed",
+    }
+}
+
+/// Facing pattern picker (a grid row).
+fn facing_combo(ui: &mut egui::Ui, id: impl std::hash::Hash, label: &str, p: &mut stepmill::FacingPattern) {
+    ui.label(label).on_hover_text(if label == "Facing" { "Pattern of the facing pass over stock taller than the part" } else { "How the facing pass covers the area" });
+    egui::ComboBox::from_id_salt(id).selected_text(p.name()).show_ui(ui, |ui| {
+        for k in stepmill::FacingPattern::ALL {
+            ui.selectable_value(p, k, k.name()).on_hover_text(k.hover());
+        }
+    });
+    ui.end_row();
+}
+
 /// Parameter editor for one operation.
 fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter], engravers: &[model::Engraver]) {
     egui::Grid::new(("op_params", i)).num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| match kind {
         OpKind::Face(f) => {
             cutter_combo(ui, i, &mut f.cutter, cutters);
+            facing_combo(ui, ("face_pattern", i), "Pattern", &mut f.pattern);
             num(ui, "Stepover", &mut f.stepover_pct, 0.5, " %", "% of cutter diameter");
             num(ui, "Depth per pass", &mut f.depth_per_pass, 0.05, " mm", "");
             num(ui, "Extra past outline", &mut f.overlap, 0.1, " mm", "Facing clears everything above the surface inside the part's outside profile offset outwards by half the tool diameter; this goes further out still (default 0)");
@@ -1850,7 +1948,8 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
             let was = p.strategy;
             egui::ComboBox::from_id_salt(("strategy", i))
                 .selected_text(match p.strategy {
-                    Strategy::Standard => "Standard",
+                    // (mixed is a roughing strategy: a pocket cuts it as standard)
+                    Strategy::Standard | Strategy::Mixed => "Standard",
                     Strategy::Adaptive => "Adaptive clearing",
                 })
                 .show_ui(ui, |ui| {
@@ -1941,11 +2040,16 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
                 .selected_text(match r.strategy {
                     Strategy::Standard => "Standard",
                     Strategy::Adaptive => "Adaptive clearing",
+                    Strategy::Mixed => "Mixed",
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut r.strategy, Strategy::Standard, "Standard");
                     ui.selectable_value(&mut r.strategy, Strategy::Adaptive, "Adaptive clearing")
                         .on_hover_text("Trochoidal loops (default stepover 20 %): one pass down narrow bands such as the one round the outside profile");
+                    ui.selectable_value(&mut r.strategy, Strategy::Mixed, "Mixed").on_hover_text(
+                        "Adaptive clearing only on the outermost loop, round the band's edge against the stock \
+                         (trochoids at half the stepover); standard offset passes everywhere else",
+                    );
                 });
             r.stepover_pct = stepmill::stepover_for(was, r.strategy, r.stepover_pct);
             ui.end_row();
@@ -1965,6 +2069,14 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
             ui.label("Clear voids");
             ui.checkbox(&mut r.clear_voids, "")
                 .on_hover_text("Pockets and steps (anything with a face below) are always cleared.\nTicked: holes that go right through the part are cleared too.\nUnticked: through holes are only profiled.");
+            ui.end_row();
+            facing_combo(ui, ("rough_facing", i), "Facing", &mut r.facing);
+            ui.label("Inside only");
+            ui.checkbox(&mut r.inside_only, "").on_hover_text(
+                "No cutting round the part's outside profile: the clearing stays within the part's outline seen from above. \
+                 The top, pockets and the fillets / chamfers on the outside edges are still cleared (the cutter runs up to \
+                 its radius past the outline there).",
+            );
             ui.end_row();
             ui.label("Finish each layer");
             ui.checkbox(&mut r.finish_layers, "").on_hover_text(
@@ -2101,6 +2213,27 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
             ));
             ui.end_row();
         }
+        OpKind::Omit(m) => {
+            let mut gone = None;
+            for (k, f) in m.fills.iter().enumerate() {
+                ui.label(format!("Area {}", k + 1));
+                ui.horizontal(|ui| {
+                    let c = f.outer.iter().flatten().fold([0.0, 0.0, 0.0], |a, p| [a[0] + p[0], a[1] + p[1], a[2] + 1.0]);
+                    ui.label(format!("at X{} Y{}, filled Z{} to Z{}", gcode::fmt(c[0] / c[2].max(1.0)), gcode::fmt(c[1] / c[2].max(1.0)), gcode::fmt(f.bottom), gcode::fmt(f.top)));
+                    if ui.small_button("🗑").on_hover_text("Stop omitting this area").clicked() {
+                        gone = Some(k);
+                    }
+                });
+                ui.end_row();
+            }
+            if let Some(k) = gone {
+                m.fills.remove(k);
+            }
+            if m.fills.is_empty() {
+                ui.weak("No areas: right-click a pocket, hole or step and choose Omit area");
+                ui.end_row();
+            }
+        }
         OpKind::Tab(t) => {
             num(ui, "Z height", &mut t.z_height, 0.05, " mm", "Extruded up from the edge");
             num(ui, "Width", &mut t.width, 0.1, " mm", "Along the edge");
@@ -2119,6 +2252,22 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
 mod tests {
     use super::*;
     use std::f64::consts::FRAC_PI_2;
+
+    #[test]
+    fn new_ops_take_the_settings_defaults() {
+        let m = step::parse_model(include_str!("../testdata/pocket_block.step")).unwrap();
+        let stock = stepmill::Stock { x: 4.0, y: 4.0, z: 1.0, ..Default::default() }.bounds(m.min, m.max);
+        let top = m.faces.iter().position(|f| f.is_up_horizontal() && f.z().abs() < 1e-6).unwrap();
+        let s = Settings::default();
+        let (r, f) = (rough_op(&m, stock, &s), face_op(&m, top, 1.0, &s));
+        assert_eq!((r.strategy, r.stepover_pct, r.facing, f.pattern), (Strategy::Standard, 40.0, stepmill::FacingPattern::Unidirectional, stepmill::FacingPattern::Unidirectional));
+        let s = Settings { rough_strategy: Strategy::Adaptive, face_pattern: stepmill::FacingPattern::Spiral, ..Default::default() };
+        let (r, f) = (rough_op(&m, stock, &s), face_op(&m, top, 1.0, &s));
+        assert_eq!((r.strategy, r.stepover_pct, r.facing, f.pattern), (Strategy::Adaptive, 20.0, stepmill::FacingPattern::Spiral, stepmill::FacingPattern::Spiral));
+        // older settings files without them
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!((old.rough_strategy, old.face_pattern), (Strategy::Standard, stepmill::FacingPattern::Unidirectional));
+    }
 
     fn block() -> step::Model {
         step::parse_model(include_str!("../testdata/pocket_block.step")).unwrap()

@@ -19,7 +19,7 @@
 //!   "settings_file": "stepcam-settings.json",                // optional
 //!   "settings": {"spindle_rpm": 12000, ...},                 // optional overrides
 //!   "ops": [ {"type": "rough" | "finish" | "face" | "pocket" | "profile" | "engrave" |
-//!                     "thread" | "thread_alike" | "tab",
+//!                     "thread" | "thread_alike" | "tab" | "omit",   // omit: no params
 //!             "picks": [{"point": [x,y,z], "normal": [..]?, "tangent": [..]?}, ...],
 //!             "on": "face" | "edge",                         // pocket only
 //!             "enabled": true,
@@ -147,7 +147,8 @@ fn run(spec: &Spec) -> (Value, i32) {
         },
     };
     if !spec.settings.is_empty() {
-        match merge(&settings, &spec.settings, "settings") {
+        let given: Map<String, Value> = spec.settings.iter().map(|(k, v)| (k.clone(), enum_name(k, v))).collect();
+        match merge(&settings, &given, "settings") {
             Ok(s) => settings = s,
             Err(e) => return fail(vec![e]),
         }
@@ -259,6 +260,7 @@ fn simulate(code: &str, s: &Settings, stock: ([f64; 3], [f64; 3]), model: &step:
     let tol = spec.tolerance as f32;
     let (mut cells, mut at, mut gouged, mut gouge, mut left) = (0usize, 0usize, 0usize, 0f32, 0f32);
     let mut worst: Option<[f64; 3]> = None;
+    let mut left_at: Option<[f64; 3]> = None;
     for (k, (&z, &p)) in sm.map.z.iter().zip(&part).enumerate() {
         if p.is_nan() {
             continue;
@@ -275,7 +277,11 @@ fn simulate(code: &str, s: &Settings, stock: ([f64; 3], [f64; 3]), model: &step:
         } else if d <= tol {
             at += 1;
         }
-        left = left.max(d);
+        if d > left {
+            left = d;
+            let c = sm.map.centre(k % sm.map.nx, k / sm.map.nx);
+            left_at = Some([c[0], c[1], z as f64]);
+        }
     }
     let events: Vec<Value> = sm
         .events
@@ -295,6 +301,7 @@ fn simulate(code: &str, s: &Settings, stock: ([f64; 3], [f64; 3]), model: &step:
         "cell_mm": sm.map.cell,
         "at_size_pct": if cells > 0 { 100.0 * at as f64 / cells as f64 } else { 0.0 },
         "max_stock_left": left.max(0.0),
+        "max_stock_left_at": left_at,
         "gouged_cells": gouged,
         "max_gouge": gouge,
         "max_gouge_at": worst,
@@ -349,7 +356,7 @@ fn build(o: &OpSpec, model: &step::Model, stock: ([f64; 3], [f64; 3]), stock_top
     Ok(match o.kind.as_str() {
         "rough" => vec![OpKind::Rough(crate::rough_op(model, stock, s))],
         "finish" => vec![OpKind::Finish(crate::finish_op(model, stock, s))],
-        "face" => faces()?.into_iter().map(|fi| up_flat(fi).map(|_| OpKind::Face(crate::face_op(model, fi, stock_top)))).collect::<Result<_, _>>()?,
+        "face" => faces()?.into_iter().map(|fi| up_flat(fi).map(|_| OpKind::Face(crate::face_op(model, fi, stock_top, s)))).collect::<Result<_, _>>()?,
         "pocket" => match o.on.as_deref() {
             Some("edge") => chains(edges()?).into_iter().map(|e| crate::edge_pocket(model, e, stock_top).map(OpKind::Pocket)).collect::<Result<_, _>>()?,
             Some("face") | None => faces()?
@@ -395,7 +402,11 @@ fn build(o: &OpSpec, model: &step::Model, stock: ([f64; 3], [f64; 3]), stock_top
             v
         }
         "tab" => edges()?.into_iter().map(|(e, p, a)| OpKind::Tab(crate::mill_tab(model, e, p, a))).collect(),
-        k => return Err(format!("unknown operation type {k:?} (rough, finish, face, pocket, profile, engrave, thread, thread_alike, tab)")),
+        "omit" => {
+            let fills = faces()?.into_iter().map(|fi| crate::stepmill::omit_fill(model, fi).map_err(|e| format!("face at {}: {e}", pt(model, fi)))).collect::<Result<Vec<_>, _>>()?;
+            vec![OpKind::Omit(crate::stepmill::OmitOp { fills })]
+        }
+        k => return Err(format!("unknown operation type {k:?} (rough, finish, face, pocket, profile, engrave, thread, thread_alike, tab, omit)")),
     })
 }
 
@@ -535,10 +546,14 @@ fn merge<T: serde::Serialize + serde::de::DeserializeOwned>(base: &T, over: &Map
 fn enum_name(key: &str, v: &Value) -> Value {
     let Some(s) = v.as_str() else { return v.clone() };
     match key {
-        "strategy" | "entry" | "side" | "h_align" | "v_align" => {
-            let mut c = s.chars();
-            json!(c.next().map(|f| f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()).unwrap_or_default())
-        }
+        // "square_spiral" / "square spiral" -> SquareSpiral
+        "strategy" | "entry" | "side" | "h_align" | "v_align" | "pattern" | "facing" | "face_pattern" | "rough_strategy" => json!(s
+            .split(['_', ' ', '-'])
+            .map(|w| {
+                let mut c = w.chars();
+                c.next().map(|f| f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()).unwrap_or_default()
+            })
+            .collect::<String>()),
         "thread" => json!(s.to_uppercase().replace('.', "_")),
         _ => v.clone(),
     }
@@ -551,9 +566,11 @@ fn apply_params(kind: OpKind, params: &Map<String, Value>, s: &Settings) -> Resu
         return Ok(kind);
     }
     let mut p: Map<String, Value> = params.iter().map(|(k, v)| (k.clone(), enum_name(k, v))).collect();
-    // adaptive clearing defaults to its own stepover
-    if p.get("strategy") == Some(&json!("Adaptive")) && !p.contains_key("stepover_pct") {
-        p.insert("stepover_pct".into(), json!(crate::stepmill::STEPOVER_ADAPTIVE));
+    // a strategy given without a stepover takes its own default (adaptive
+    // 20 %, else 40 %), whatever the settings' default strategy gave
+    if let (Some(st), false) = (p.get("strategy").and_then(|v| v.as_str()), p.contains_key("stepover_pct")) {
+        let so = if st == "Adaptive" { crate::stepmill::STEPOVER_ADAPTIVE } else { crate::stepmill::STEPOVER_STANDARD };
+        p.insert("stepover_pct".into(), json!(so));
     }
     let tool = p.remove("tool");
     let cutter = |t: &Value| -> Result<crate::model::Cutter, String> {
@@ -625,6 +642,7 @@ fn apply_params(kind: OpKind, params: &Map<String, Value>, s: &Settings) -> Resu
             }
             OpKind::Tab(merge(&o, &p, "tab")?)
         }
+        OpKind::Omit(_) => return Err("omit takes no parameters".into()),
     })
 }
 

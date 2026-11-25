@@ -351,6 +351,11 @@ pub struct Settings {
     pub thread_mills: Vec<ThreadMill>,
     /// Tapered engraving bits.
     pub engravers: Vec<Engraver>,
+
+    /// Pattern given to new Face ops and to new Rough ops' stock facing.
+    pub face_pattern: crate::stepmill::FacingPattern,
+    /// Strategy given to new Rough ops (its default stepover with it).
+    pub rough_strategy: crate::stepmill::Strategy,
 }
 
 impl Default for Settings {
@@ -371,6 +376,8 @@ impl Default for Settings {
             cutters: Cutter::DEFAULTS.to_vec(),
             thread_mills: ThreadSize::ALL.iter().map(|&t| ThreadMill::default_for(t)).collect(),
             engravers: Engraver::DEFAULTS.to_vec(),
+            face_pattern: crate::stepmill::FacingPattern::Unidirectional,
+            rough_strategy: crate::stepmill::Strategy::Standard,
         }
     }
 }
