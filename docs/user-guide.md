@@ -170,9 +170,11 @@ Every operation has a **Tool** (from the tool table), **Feed** (mm/min) and **Sp
 - **Stock to leave:** left on all walls and floors for finishing operations. The default is 0.
 - **Clear voids** (default on): pockets, steps and counterbores are always cleared. When unticked, holes that go right through the part are only profiled round their wall, so the core can drop out.
 - **Overcut Z:** carries the last layer this far below Bottom Z, for example to cut the part free.
-- **Strategy:** **Standard** (concentric offset passes) or **Adaptive clearing** (trochoidal loops, with their own advance per loop).
-  - With adaptive clearing, the band round the outside profile is widened by the loops' diameter (0.8 × tool Ø), so the outside profile is cut with trochoidal loops too instead of a full-width slot. Facing covers the same wider band.
-  - Wide areas are fully cleared: what the loops leave between each other (along the middle of wide regions, and in corners) is cleared with standard passes first.
+- **Strategy:** **Standard** (concentric offset passes) or **Adaptive clearing** (trochoidal loops). Choosing adaptive sets the stepover (its advance per loop) to 20 % if it was still at the standard 40 %. Switching back restores 40 %.
+  - With adaptive clearing, the band round the outside profile is widened by the loops' diameter (0.8 × tool Ø), so the outside profile is cut with trochoidal loops too instead of a full-width slot. Facing covers the same wider band and finishes with a lap round its edge.
+  - **Narrow bands**, such as the one round the outside profile (an area with one island whose loops would be no wider than 1.6 × the standard 0.4 × tool Ø): one pass per layer down the middle of the band, each loop as wide as the band there. This replaces a ring of loops along each side. The advance is scaled so the cut on the longer outer side stays at the stepover.
+  - **Wider areas:** rings of loops spaced 1.4 × tool Ø apart from the walls, because one loop as wide as the area would mostly cut air.
+  - **Leftovers:** whatever the loops leave (along the middle of wide areas, square corners a band's loop can't reach) is cleared first with standard passes at 40 % stepover.
 - **Finish each layer** (default on): after clearing each layer, a climb-milled pass round the part's walls at tool radius + stock to leave. This cleans up the scallops that adaptive clearing leaves. The outer limit of the band is not a wall and is left out. Untick it to clear only.
 - **Entry:** **Helix**, **Zigzag** or **Plunge**. **Ramp angle** is the helix or zigzag angle.
 

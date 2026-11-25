@@ -934,6 +934,141 @@ fn stations(p: &[P2], s0: f64, s1: f64) -> Vec<f64> {
     mid
 }
 
+/// How a clearing loop is cut.
+#[derive(Clone, Debug)]
+enum LoopCut {
+    /// Followed as it is.
+    Plain,
+    /// Trochoidal loops of a fixed radius along it.
+    Trochoid,
+    /// Trochoidal loops along it whose radius (one per vertex) spans the
+    /// area's width there.
+    Varying(Vec<f64>),
+}
+
+/// Closest point on a closed loop to `p`.
+fn closest_on_loop(l: &[P2], p: P2) -> P2 {
+    let mut best = (f64::INFINITY, l[0]);
+    for i in 0..l.len() {
+        let (a, b) = (l[i], l[(i + 1) % l.len()]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let l2 = dx * dx + dy * dy;
+        let t = if l2 < 1e-18 { 0.0 } else { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0.0, 1.0) };
+        let q = [a[0] + dx * t, a[1] + dy * t];
+        let d = d2(p, q);
+        if d < best.0 {
+            best = (d, q);
+        }
+    }
+    best.1
+}
+
+/// A closed loop resampled at about `h` spacing (not closed).
+fn resample_loop(l: &[P2], h: f64) -> Vec<P2> {
+    let mut closed = l.to_vec();
+    closed.push(l[0]);
+    let len = path_len(&closed);
+    let n = ((len / h).ceil() as usize).max(8);
+    (0..n).map(|i| point_at(&closed, len * i as f64 / n as f64)).collect()
+}
+
+/// Adaptive clearing of an area with one island (e.g. the band round a
+/// part) in a single pass: a centre path midway between the island's side
+/// (`inner`, CW) and the outer side (`outer`, CCW) of where the tool centre
+/// may go, with a loop radius at each point that spans the width there but
+/// never leaves that area. Returns the centre path, the radii, and the area
+/// the tool cuts (tool radius `r` added) for the cleanup of what is left.
+fn single_pass(outer: &[P2], inner: &[P2], allowed: &[Vec<P2>], r: f64) -> Option<(Vec<P2>, Vec<f64>, geo::MultiPolygon<f64>)> {
+    let ps = resample_loop(inner, 0.25);
+    let qs: Vec<P2> = ps.iter().map(|&p| closest_on_loop(outer, p)).collect();
+    let mid: Vec<P2> = ps.iter().zip(&qs).map(|(p, q)| [(p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0]).collect();
+    // smooth the centre path only where it jumps (nearest points jump at
+    // corners): elsewhere the exact midpoint lets the loops reach both sides.
+    // Then fit the radius to the room actually there
+    let n = mid.len();
+    let jump = |i: usize, j: usize| d2(mid[i % n], mid[j % n]) > 0.5;
+    let c: Vec<P2> = (0..n)
+        .map(|i| {
+            if !jump(i + n - 1, i) && !jump(i, i + 1) {
+                return mid[i];
+            }
+            let (mut x, mut y) = (0.0, 0.0);
+            for k in 0..5 {
+                let q = mid[(i + n + k - 2) % n];
+                x += q[0];
+                y += q[1];
+            }
+            [x / 5.0, y / 5.0]
+        })
+        .collect();
+    let rad: Vec<f64> = c.iter().zip(ps.iter().zip(&qs)).map(|(c, (p, q))| (d2(*p, *q) / 2.0).min(boundary_dist(allowed, *c)) - 1e-6).map(|v| v.max(0.0)).collect();
+    if !c.iter().all(|&q| inside(allowed, q) || boundary_dist(allowed, q) < 1e-3) {
+        return None; // not a simple band: use the rings
+    }
+    // what the loops cut: a band of half-width radius + r round the path,
+    // as quads between consecutive samples (an under-estimate: safe for the
+    // cleanup)
+    let swept = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut quads = vec![];
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let side = |k: usize| {
+                let (a, b) = (ps[k], qs[k]);
+                let l = d2(a, b).max(1e-9);
+                let u = [(b[0] - a[0]) / l, (b[1] - a[1]) / l];
+                // (+ a hair: the loops reach the walls, so the cleanup
+                // does not chase numerical slivers along them)
+                let w = rad[k] + r + 0.002;
+                ([c[k][0] - u[0] * w, c[k][1] - u[1] * w], [c[k][0] + u[0] * w, c[k][1] + u[1] * w])
+            };
+            let ((a0, b0), (a1, b1)) = (side(i), side(j));
+            let mut q = vec![a0, b0, b1, a1];
+            if signed_area(&q).abs() < 1e-9 {
+                continue;
+            }
+            if signed_area(&q) < 0.0 {
+                q.reverse();
+            }
+            quads.push(to_geo(&q, &[]));
+        }
+        union_tree(quads)
+    }))
+    .ok()?;
+    Some((c, rad, swept))
+}
+
+/// Trochoidal loops along a closed centre path with a radius per vertex,
+/// `advance` along the path per loop.
+fn trochoid_var(center: &[P2], radius: &[f64], advance: f64) -> Vec<P2> {
+    let mut cl = center.to_vec();
+    cl.push(center[0]);
+    let mut rl = radius.to_vec();
+    rl.push(radius[0]);
+    let mut cum = vec![0.0];
+    for w in cl.windows(2) {
+        cum.push(cum.last().unwrap() + d2(w[0], w[1]));
+    }
+    let l = *cum.last().unwrap();
+    let rad_at = |s: f64| {
+        let k = cum.partition_point(|&c| c <= s).clamp(1, cum.len() - 1);
+        let (s0, s1) = (cum[k - 1], cum[k]);
+        let t = if s1 > s0 { ((s - s0) / (s1 - s0)).clamp(0.0, 1.0) } else { 0.0 };
+        rl[k - 1] + (rl[k] - rl[k - 1]) * t
+    };
+    let revs = (l / advance.max(0.01)).ceil().max(1.0) as usize;
+    let per_rev = 24;
+    let n = revs * per_rev;
+    (0..=n)
+        .map(|i| {
+            let s = l * i as f64 / n as f64;
+            let c = point_at(&cl, s);
+            let rr = rad_at(s);
+            let th = TAU * i as f64 / per_rev as f64 - PI / 2.0;
+            [c[0] + rr * th.cos(), c[1] + rr * th.sin()]
+        })
+        .collect()
+}
+
 /// Points within `w` of a closed loop (either orientation).
 fn ring_around(l: &[P2], w: f64) -> geo::MultiPolygon<f64> {
     use geo::BooleanOps;
@@ -945,13 +1080,13 @@ fn ring_around(l: &[P2], w: f64) -> geo::MultiPolygon<f64> {
     ccw(offset_region(&l, &[], -w)).difference(&ccw(offset_region(&l, &[], w)))
 }
 
-/// Standard loops for what adaptive clearing's trochoidal `loops` (each
-/// cutting `reach` either side of its centre loop) leave of `area` (the
-/// material to clear): a pocket of the tool centres that reach it (the
+/// Standard loops for what adaptive clearing's trochoidal loops (which cut
+/// `swept`) leave of `area` (the material to clear): a pocket of the tool
+/// centres that reach it (the
 /// left-over material grown by the tool radius `r`, kept to where the tool
 /// centre may go, `allowed`), both as offset loops (CCW outers, CW holes).
 /// Offset index from `k0` up (inside out, so they are cut first).
-fn adaptive_cleanup(loops: &[(usize, Vec<P2>, bool)], area: &[Vec<P2>], allowed: &[Vec<P2>], reach: f64, r: f64, step: f64, k0: usize) -> Vec<(usize, Vec<P2>, bool)> {
+fn adaptive_cleanup(swept: &geo::MultiPolygon<f64>, area: &[Vec<P2>], allowed: &[Vec<P2>], r: f64, step: f64, k0: usize) -> Vec<(usize, Vec<P2>, LoopCut)> {
     use geo::BooleanOps;
     let region = |ls: &[Vec<P2>]| {
         let outers = union_all(ls.iter().filter(|l| signed_area(l) > 0.0).map(|l| to_geo(l, &[])));
@@ -959,8 +1094,7 @@ fn adaptive_cleanup(loops: &[(usize, Vec<P2>, bool)], area: &[Vec<P2>], allowed:
         outers.difference(&holes)
     };
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let swept = union_tree(loops.iter().flat_map(|(_, l, _)| ring_around(l, reach).0).collect());
-        let left = region(area).difference(&swept);
+        let left = region(area).difference(swept);
         // tool centres within a radius of what is left (a hair less, so the
         // outer loop just touches it), where the tool centre may go
         let mut grown: Vec<Vec<P2>> = vec![];
@@ -993,11 +1127,27 @@ fn adaptive_cleanup(loops: &[(usize, Vec<P2>, bool)], area: &[Vec<P2>], allowed:
             if ls.is_empty() || j > 10000 {
                 break;
             }
-            out.extend(ls.into_iter().map(|l| (k0 + j, l, false)));
+            out.extend(ls.into_iter().map(|l| (k0 + j, l, LoopCut::Plain)));
             j += 1;
         }
     }
     out
+}
+
+/// Default stepovers (% of the cutter Ø): standard offset passes, and
+/// adaptive clearing (its advance per trochoidal loop).
+pub const STEPOVER_STANDARD: f64 = 40.0;
+pub const STEPOVER_ADAPTIVE: f64 = 20.0;
+
+/// The stepover after switching strategy: a stepover still at the old
+/// strategy's default takes the new one's.
+pub fn stepover_for(old: Strategy, new: Strategy, stepover: f64) -> f64 {
+    let default = |s: Strategy| if s == Strategy::Adaptive { STEPOVER_ADAPTIVE } else { STEPOVER_STANDARD };
+    if old != new && (stepover - default(old)).abs() < 1e-9 {
+        default(new)
+    } else {
+        stepover
+    }
 }
 
 /// Radius of adaptive clearing's trochoidal loops (fraction of the cutter Ø).
@@ -1331,29 +1481,75 @@ fn pocket_moves(op: &PocketOp, retract: f64, from: P2) -> Result<Vec<Mv>, String
 
     // centre loops for roughing, with their offset index
     let step = (op.stepover_pct / 100.0 * d).max(0.01);
-    // (offset index, loop, cut with trochoids)
-    let mut centre: Vec<(usize, Vec<P2>, bool)> = Vec::new();
+    // (offset index, loop, how it is cut)
+    let mut centre: Vec<(usize, Vec<P2>, LoopCut)> = Vec::new();
     let mut troch_r = 0.0;
+    // advance per loop of the single-pass trochoids
+    let mut advance = step;
+    // standard passes clearing what the trochoids leave
+    let clean_step = step.max(0.4 * d);
     if op.strategy == Strategy::Adaptive {
         troch_r = TROCHOID_R * d;
-        let spacing = 1.4 * d;
-        let mut k = 0;
-        loop {
-            let ls = offset_region(&op.outer, &islands, rough0 + troch_r + k as f64 * spacing);
-            if ls.is_empty() || k > 10000 {
-                break;
+        let finish_area = offset_region(&op.outer, &islands, op.finish.max(0.0));
+        // one island (e.g. the band round a part): a single pass down the
+        // middle, its loops as wide as the band
+        let ccw: Vec<&Vec<P2>> = allowed.iter().filter(|l| signed_area(l) > 0.0).collect();
+        let cw: Vec<&Vec<P2>> = allowed.iter().filter(|l| signed_area(l) < 0.0).collect();
+        if ccw.len() == 1 && cw.len() == 1 {
+            if let Some((path, rad, swept)) = single_pass(ccw[0], cw[0], &allowed, r) {
+                // the outer side travels further per loop: keep its cut to the stepover
+                let mut cp = path.clone();
+                cp.push(path[0]);
+                let adv = step * (path_len(&cp) / path_len(&[ccw[0].clone(), vec![ccw[0][0]]].concat())).min(1.0);
+                // a loop as wide as the band cuts mostly air when the band is
+                // wide: use it only where it is the shorter way (narrow bands,
+                // like the one round a part's outside profile)
+                let single: f64 = cp.windows(2).zip(&rad).map(|(w, rr)| d2(w[0], w[1]) / adv.max(0.01) * TAU * rr.max(0.05 * d)).sum();
+                let rings: f64 = {
+                    let mut t = 0.0;
+                    let mut k = 0;
+                    loop {
+                        let ls = offset_region(&op.outer, &islands, rough0 + troch_r + k as f64 * 1.4 * d);
+                        if ls.is_empty() || k > 10000 {
+                            break;
+                        }
+                        t += ls.iter().map(|l| (path_len(l) + d2(l[0], *l.last().unwrap())) / step * TAU * troch_r).sum::<f64>();
+                        k += 1;
+                    }
+                    t
+                };
+                // (with the standard passes it needs where it cannot reach)
+                let cleanup = adaptive_cleanup(&swept, &finish_area, &allowed, r, clean_step, 1);
+                let single = single + cleanup.iter().map(|(_, l, _)| path_len(l) + d2(l[0], *l.last().unwrap())).sum::<f64>();
+                let narrow = rad.iter().cloned().fold(0.0, f64::max) <= 1.6 * troch_r;
+                if rings <= 0.0 || (narrow && single <= rings) {
+                    advance = adv;
+                    centre.push((0, path, LoopCut::Varying(rad)));
+                    centre.extend(cleanup);
+                }
             }
-            centre.extend(ls.into_iter().map(|l| (k, l, true)));
-            k += 1;
         }
         if centre.is_empty() {
-            troch_r = 0.0; // too narrow for trochoids: fall back to standard loops
-        } else {
-            // the loops from opposite walls stop up to a spacing short of each
-            // other: clear what they leave with standard loops (cut first,
-            // innermost first)
-            let finish_area = offset_region(&op.outer, &islands, op.finish.max(0.0));
-            centre.extend(adaptive_cleanup(&centre, &finish_area, &allowed, troch_r + r, r, step, k));
+            let spacing = 1.4 * d;
+            let mut k = 0;
+            loop {
+                let ls = offset_region(&op.outer, &islands, rough0 + troch_r + k as f64 * spacing);
+                if ls.is_empty() || k > 10000 {
+                    break;
+                }
+                centre.extend(ls.into_iter().map(|l| (k, l, LoopCut::Trochoid)));
+                k += 1;
+            }
+            if centre.is_empty() {
+                troch_r = 0.0; // too narrow for trochoids: fall back to standard loops
+            } else {
+                // the loops from opposite walls stop up to a spacing short of
+                // each other: clear what they leave with standard loops (cut
+                // first, innermost first)
+                let swept = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| union_tree(centre.iter().flat_map(|(_, l, _)| ring_around(l, troch_r + r).0).collect())))
+                    .unwrap_or_else(|_| geo::MultiPolygon::new(vec![]));
+                centre.extend(adaptive_cleanup(&swept, &finish_area, &allowed, r, clean_step, k));
+            }
         }
     }
     if centre.is_empty() {
@@ -1363,7 +1559,7 @@ fn pocket_moves(op: &PocketOp, retract: f64, from: P2) -> Result<Vec<Mv>, String
             if ls.is_empty() || k > 10000 {
                 break;
             }
-            centre.extend(ls.into_iter().map(|l| (k, l, false)));
+            centre.extend(ls.into_iter().map(|l| (k, l, LoopCut::Plain)));
             k += 1;
         }
     }
@@ -1387,8 +1583,18 @@ fn pocket_moves(op: &PocketOp, retract: f64, from: P2) -> Result<Vec<Mv>, String
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .unwrap();
             let ci = remaining.remove(ri);
-            let loop_c = start_near(&centre[ci].1, here);
-            let path: Vec<P2> = if centre[ci].2 { trochoid(&loop_c, troch_r, step) } else { loop_c };
+            let path: Vec<P2> = match &centre[ci].2 {
+                LoopCut::Plain => start_near(&centre[ci].1, here),
+                LoopCut::Trochoid => trochoid(&start_near(&centre[ci].1, here), troch_r, step),
+                LoopCut::Varying(rad) => {
+                    // start nearest the tool, radii turned with the path
+                    let l = &centre[ci].1;
+                    let i0 = (0..l.len()).min_by(|&a, &b| d2(l[a], here).total_cmp(&d2(l[b], here))).unwrap_or(0);
+                    let c: Vec<P2> = l[i0..].iter().chain(l[..i0].iter()).copied().collect();
+                    let rr: Vec<f64> = rad[i0..].iter().chain(rad[..i0].iter()).copied().collect();
+                    trochoid_var(&c, &rr, advance)
+                }
+            };
             let p0 = path[0];
 
             if first {
@@ -1463,7 +1669,7 @@ fn face_moves(op: &FaceOp, retract: f64) -> Vec<Mv> {
     let r = op.cutter.dia() / 2.0;
     if !op.outline.is_empty() {
         let centres = grow_loops(&op.outline, r + op.overlap.max(0.0) + OPEN_EDGE);
-        return facing_moves(&centres, &op.outline, FacingCut { cutter: op.cutter, stepover_pct: op.stepover_pct, start_z: op.start_z, z: op.z, depth_per_pass: op.depth_per_pass, feed: op.feed }, retract);
+        return facing_moves(&centres, &op.outline, FacingCut { cutter: op.cutter, stepover_pct: op.stepover_pct, start_z: op.start_z, z: op.z, depth_per_pass: op.depth_per_pass, feed: op.feed, edge_lap: false }, retract);
     }
     // no outline (older jobs): the region box, edge `overlap` past it
     let [minx, miny, maxx, maxy] = op.region;
@@ -1471,7 +1677,7 @@ fn face_moves(op: &FaceOp, retract: f64) -> Vec<Mv> {
     let (x0, x1) = (minx - ov - r, maxx + ov + r);
     let rect = vec![[x0, miny - ov - r], [x1, miny - ov - r], [x1, maxy + ov + r], [x0, maxy + ov + r]];
     let inner = vec![vec![[minx - ov, miny - ov], [maxx + ov, miny - ov], [maxx + ov, maxy + ov], [minx - ov, maxy + ov]]];
-    facing_moves(&[rect], &inner, FacingCut { cutter: op.cutter, stepover_pct: op.stepover_pct, start_z: op.start_z, z: op.z, depth_per_pass: op.depth_per_pass, feed: op.feed }, retract)
+    facing_moves(&[rect], &inner, FacingCut { cutter: op.cutter, stepover_pct: op.stepover_pct, start_z: op.start_z, z: op.z, depth_per_pass: op.depth_per_pass, feed: op.feed, edge_lap: false }, retract)
 }
 
 /// Loops grown outwards by `d`, overlaps merged.
@@ -1507,6 +1713,10 @@ struct FacingCut {
     z: f64,
     depth_per_pass: f64,
     feed: f64,
+    /// After the rows of each level, a lap round the edge of the centre area,
+    /// so everything a tool radius past it is faced (the rows end on a round
+    /// edge a stepover apart and fall short of it between them).
+    edge_lap: bool,
 }
 
 /// Facing rows clipped to `centres` (where the tool centre may go, even-odd
@@ -1564,6 +1774,31 @@ fn facing_moves(centres: &[Vec<P2>], material: &[Vec<P2>], c: FacingCut, retract
                 out.feed([xa, y, z], (c.feed * 0.5).max(1.0));
                 out.feed([xb, y, z], c.feed); // +X with material towards -Y = climb
                 out.feed([xb, y, lift], c.feed);
+            }
+        }
+        if c.edge_lap {
+            for (k, l) in centres.iter().enumerate() {
+                let here = [out.pos[0], out.pos[1]];
+                // CCW round the outside (climb, stock outside), CW round
+                // holes (loops inside an odd number of others)
+                let depth = centres.iter().enumerate().filter(|(j, o)| *j != k && inside(std::slice::from_ref(*o), l[0])).count();
+                let mut l = l.clone();
+                if (signed_area(&l) > 0.0) != (depth % 2 == 0) {
+                    l.reverse();
+                }
+                let seq = start_near(&l, here);
+                let s0 = seq[0];
+                if !first && out.pos[2] <= lift + 1e-9 && seg_in(&region, here, s0) {
+                    out.rapid([s0[0], s0[1], lift]);
+                } else {
+                    out.reposition(retract, s0, lift);
+                }
+                first = false;
+                out.feed([s0[0], s0[1], z], (c.feed * 0.5).max(1.0));
+                for q in &seq[1..] {
+                    out.feed([q[0], q[1], z], c.feed);
+                }
+                out.feed([s0[0], s0[1], lift], c.feed);
             }
         }
         z_prev = z;
@@ -2048,7 +2283,7 @@ fn rough_moves(op: &RoughOp, retract: f64) -> Result<Vec<Mv>, String> {
     // same band as the layers (outline + half a tool diameter)
     if let Some(fz) = op.facing_z() {
         let outline = part_outline(&op.faces);
-        let cut = FacingCut { cutter: op.cutter, stepover_pct: op.stepover_pct, start_z: op.start_z, z: fz, depth_per_pass: op.layer_height, feed: op.feed };
+        let cut = FacingCut { cutter: op.cutter, stepover_pct: op.stepover_pct, start_z: op.start_z, z: fz, depth_per_pass: op.layer_height, feed: op.feed, edge_lap: false };
         if outline.is_empty() {
             let [x0, y0, x1, y1] = op.facing_region();
             let e = r + OPEN_EDGE;
@@ -2057,7 +2292,8 @@ fn rough_moves(op: &RoughOp, retract: f64) -> Result<Vec<Mv>, String> {
         } else {
             // over the same band the layers clear, rows across all of it
             let band = grow_loops(&outline, r + a + OPEN_EDGE + op.band_extra());
-            out.extend(facing_moves(&band, &band, cut, retract));
+            // and a lap round its edge: the layers below may hop just above it
+            out.extend(facing_moves(&band, &band, FacingCut { edge_lap: true, ..cut }, retract));
         }
         z_prev = fz;
     }
@@ -4189,5 +4425,94 @@ mod adaptive_cleanup_tests {
             }
             assert_eq!(left, 0, "{w}x{h}: cells left above the floor");
         }
+    }
+}
+
+#[cfg(test)]
+mod single_pass_tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_stepover_default() {
+        assert_eq!(stepover_for(Strategy::Standard, Strategy::Adaptive, 40.0), 20.0);
+        assert_eq!(stepover_for(Strategy::Adaptive, Strategy::Standard, 20.0), 40.0);
+        assert_eq!(stepover_for(Strategy::Standard, Strategy::Adaptive, 33.0), 33.0, "a chosen stepover stays");
+        assert_eq!(stepover_for(Strategy::Adaptive, Strategy::Adaptive, 20.0), 20.0);
+    }
+
+    /// A 5 mm wide square band (40 x 40 less a 30 x 30 island), 2 deep, Ø3.
+    fn band_job() -> StepJob {
+        let op = PocketOp {
+            z: -2.0,
+            outer: vec![[0.0, 0.0], [40.0, 0.0], [40.0, 40.0], [0.0, 40.0]],
+            islands: vec![vec![[5.0, 5.0], [35.0, 5.0], [35.0, 35.0], [5.0, 35.0]]],
+            keep_islands: true,
+            cutter: Cutter::C3x17,
+            strategy: Strategy::Adaptive,
+            stepover_pct: STEPOVER_ADAPTIVE,
+            finish: 0.0,
+            ..Default::default()
+        };
+        StepJob { ops: vec![StepOp { enabled: true, kind: OpKind::Pocket(op) }], ..Default::default() }
+    }
+
+    #[test]
+    fn single_pass_runs_down_the_middle_as_wide_as_the_band() {
+        // where the tool centre may go in the band: 1.5..38.5 less the
+        // island grown by 1.5 (6.5..33.5 with round corners): 2 mm wide
+        let allowed = offset_region(&[[0.0, 0.0], [40.0, 0.0], [40.0, 40.0], [0.0, 40.0]], &[vec![[5.0, 5.0], [35.0, 5.0], [35.0, 35.0], [5.0, 35.0]]], 1.5);
+        let outer = allowed.iter().find(|l| signed_area(l) > 0.0).unwrap();
+        let inner = allowed.iter().find(|l| signed_area(l) < 0.0).unwrap();
+        let (path, rad, _) = single_pass(outer, inner, &allowed, 1.5).unwrap();
+        // along the straight sides: centred in the band, radius half its width
+        let mut sides = 0;
+        for (c, r) in path.iter().zip(&rad) {
+            let on_side = (c[0] > 8.0 && c[0] < 32.0) || (c[1] > 8.0 && c[1] < 32.0);
+            if on_side {
+                let d = (c[0] - 1.5).min(38.5 - c[0]).min(c[1] - 1.5).min(38.5 - c[1]);
+                assert!((d - 1.0).abs() < 0.01 && (r - 1.0).abs() < 0.01, "centre {c:?} {d} from the edge, radius {r}");
+                sides += 1;
+            }
+            // never past where the tool centre may go
+            assert!(boundary_dist(&allowed, *c) >= *r - 1e-6);
+        }
+        assert!(sides > 100);
+    }
+
+    #[test]
+    fn a_narrow_band_is_cleared_in_one_pass_per_level() {
+        let s = Settings { safe_z: 10.0, ..Default::default() };
+        let code = generate(&band_job(), &s).unwrap();
+        let mut sim = crate::sim::Sim::new(crate::sim::Program::parse(&code, &s), [-2.0, -2.0, -5.0], [42.0, 42.0, 0.0], 300);
+        while !sim.seek(f64::INFINITY, std::time::Duration::from_secs(60)) {}
+        assert!(!sim.events.values().any(|e| e.kind == crate::sim::EventKind::RapidCut), "{:?}", sim.events);
+        let m = &sim.map;
+        let r = 1.5;
+        let mut left = 0;
+        for j in 0..m.ny {
+            for i in 0..m.nx {
+                let [x, y] = m.centre(i, j);
+                let z = m.z[j * m.nx + i];
+                let in_island = x > 5.05 && x < 34.95 && y > 5.05 && y < 34.95;
+                let outside = x < -0.05 || x > 40.05 || y < -0.05 || y > 40.05;
+                if in_island || outside {
+                    assert!(z > -1e-3, "wall cut at ({x}, {y})");
+                    continue;
+                }
+                // in the band and within a radius of where the tool centre may go
+                let (dx0, dy0) = ((r - x).max(x - (40.0 - r)).max(0.0), (r - y).max(y - (40.0 - r)).max(0.0));
+                let near_outer = dx0.hypot(dy0) < r - 0.1;
+                let to_island = {
+                    let dx = (5.0 - r - x).max(x - (35.0 + r)).max(0.0);
+                    let dy = (5.0 - r - y).max(y - (35.0 + r)).max(0.0);
+                    dx.hypot(dy)
+                };
+                let in_band = x > 0.1 && x < 39.9 && y > 0.1 && y < 39.9 && !(x > 4.9 && x < 35.1 && y > 4.9 && y < 35.1);
+                if in_band && near_outer && to_island > 0.0 && z > -2.0 + 1e-3 {
+                    left += 1;
+                }
+            }
+        }
+        assert_eq!(left, 0, "cells left in the band");
     }
 }

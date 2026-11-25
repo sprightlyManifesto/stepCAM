@@ -551,6 +551,10 @@ fn apply_params(kind: OpKind, params: &Map<String, Value>, s: &Settings) -> Resu
         return Ok(kind);
     }
     let mut p: Map<String, Value> = params.iter().map(|(k, v)| (k.clone(), enum_name(k, v))).collect();
+    // adaptive clearing defaults to its own stepover
+    if p.get("strategy") == Some(&json!("Adaptive")) && !p.contains_key("stepover_pct") {
+        p.insert("stepover_pct".into(), json!(crate::stepmill::STEPOVER_ADAPTIVE));
+    }
     let tool = p.remove("tool");
     let cutter = |t: &Value| -> Result<crate::model::Cutter, String> {
         let n = t.as_u64().ok_or("tool must be a tool number")? as u32;

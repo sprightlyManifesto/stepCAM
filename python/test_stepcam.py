@@ -129,6 +129,16 @@ class StepCamTests(unittest.TestCase):
         res = job.generate(str(self.out / "g.nc"))
         self.assertTrue(any("no Rough op before this Finish" in w for w in res.warnings), res.warnings)
 
+    def test_adaptive_defaults_to_a_20_percent_stepover(self):
+        part = plate()
+        job = Job(part, stock=(4, 4, 1))
+        job.rough(strategy="adaptive")
+        job.rough(strategy="adaptive", stepover=30)
+        job.rough()
+        res = job.generate(str(self.out / "s.nc"))
+        ops = [o["kind"]["Rough"] for o in json.loads(Path(res.job_path).read_text())["step"]["ops"]]
+        self.assertEqual([o["stepover_pct"] for o in ops], [20.0, 30.0, 40.0])
+
     def test_errors_are_reported(self):
         part = plate()
         job = Job(part)

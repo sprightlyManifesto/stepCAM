@@ -1847,6 +1847,7 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
         OpKind::Pocket(p) => {
             cutter_combo(ui, i, &mut p.cutter, cutters);
             ui.label("Strategy");
+            let was = p.strategy;
             egui::ComboBox::from_id_salt(("strategy", i))
                 .selected_text(match p.strategy {
                     Strategy::Standard => "Standard",
@@ -1854,8 +1855,9 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut p.strategy, Strategy::Standard, "Standard").on_hover_text("Concentric offset passes");
-                    ui.selectable_value(&mut p.strategy, Strategy::Adaptive, "Adaptive clearing").on_hover_text("Trochoidal loops along offset paths");
+                    ui.selectable_value(&mut p.strategy, Strategy::Adaptive, "Adaptive clearing").on_hover_text("Trochoidal loops along offset paths (default stepover 20 %)");
                 });
+            p.stepover_pct = stepmill::stepover_for(was, p.strategy, p.stepover_pct);
             ui.end_row();
             ui.label("Entry");
             egui::ComboBox::from_id_salt(("entry", i))
@@ -1934,6 +1936,7 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
         OpKind::Rough(r) => {
             cutter_combo(ui, i, &mut r.cutter, cutters);
             ui.label("Strategy");
+            let was = r.strategy;
             egui::ComboBox::from_id_salt(("rough_strategy", i))
                 .selected_text(match r.strategy {
                     Strategy::Standard => "Standard",
@@ -1941,8 +1944,10 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut r.strategy, Strategy::Standard, "Standard");
-                    ui.selectable_value(&mut r.strategy, Strategy::Adaptive, "Adaptive clearing");
+                    ui.selectable_value(&mut r.strategy, Strategy::Adaptive, "Adaptive clearing")
+                        .on_hover_text("Trochoidal loops (default stepover 20 %): one pass down narrow bands such as the one round the outside profile");
                 });
+            r.stepover_pct = stepmill::stepover_for(was, r.strategy, r.stepover_pct);
             ui.end_row();
             ui.label("Entry");
             egui::ComboBox::from_id_salt(("rough_entry", i))

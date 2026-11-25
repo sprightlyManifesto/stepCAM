@@ -212,8 +212,9 @@ works layer by layer from the stock top (Start Z) down to the part bottom
   Profile finishing ops.
 * Strategy (standard / adaptive), entry (helix / zigzag / plunge), stepover,
   feed, speed and ramp angle work as for pockets. Climb milled.
-  * With **adaptive**, the band round the outside profile (and the stock facing) is widened by the trochoid loops' diameter (0.8 × tool Ø), so the outside profile is cut with loops rather than slotted.
-  * Whatever the loops leave between them (middles of wide areas, corners) is cleared with standard passes.
+  * With **adaptive** (default stepover 20 %), the band round the outside profile is widened by the trochoid loops' diameter (0.8 × tool Ø). The stock facing covers the same band and ends with a lap round its edge.
+  * **Narrow bands** (one island, like the band round the outside profile) get one pass per layer down the middle, each loop as wide as the band there. Wider areas get rings of loops from the walls.
+  * Whatever the loops leave (middles of wide areas, square corners) is cleared with standard passes.
 * **Finish each layer** (default on): a contour pass round the part's walls after each layer is cleared (not the band's outer limit). Untick it to clear only.
 
 The part is seen from above: flat up-facing surfaces count at their Z,
