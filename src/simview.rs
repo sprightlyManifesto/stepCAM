@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Source {
     Step,
+    /// The Nest tab's program.
+    Nest,
     File,
 }
 
@@ -61,6 +63,14 @@ pub struct Inputs<'a> {
     /// Step milling program zero (model coordinates): the step program is
     /// relative to it, so its moves are mapped back before simulating.
     pub step_origin: P3,
+    /// Nest tab: its program, sheet, program zero and copy offsets.
+    pub nest_code: &'a str,
+    pub nest_stock: Option<(P3, P3)>,
+    pub nest_origin: P3,
+    pub nest_copies: &'a [crate::stepmill::Placed],
+    /// Step milling stock model (triangles), when the stock is one: the
+    /// simulation starts from its shape (on every copy, for the nest).
+    pub stock_tris: Option<&'a [[P3; 3]]>,
 }
 
 /// Comparison with the model: worst gouge, cells gouged, most stock left.
@@ -202,6 +212,7 @@ impl SimTab {
     fn code<'a>(&'a self, inp: &Inputs<'a>) -> &'a str {
         match self.source {
             Source::Step => inp.step_code,
+            Source::Nest => inp.nest_code,
             Source::File => &self.file_code,
         }
     }
@@ -210,6 +221,11 @@ impl SimTab {
     fn auto_stock(&self, inp: &Inputs, prog: &Program) -> Option<(P3, P3)> {
         if self.source == Source::Step {
             if let Some(s) = inp.step_stock {
+                return Some(s);
+            }
+        }
+        if self.source == Source::Nest {
+            if let Some(s) = inp.nest_stock {
                 return Some(s);
             }
         }
@@ -227,18 +243,20 @@ impl SimTab {
     /// Rebuild the program / sim when what it depends on changed.
     fn sync(&mut self, inp: &Inputs) {
         let code = self.code(inp);
-        let pk = hash_of((self.source, code, format!("{:?}", inp.settings), bits(inp.step_origin)));
+        let pk = hash_of((self.source, code, format!("{:?}", inp.settings), bits(inp.step_origin), bits(inp.nest_origin), inp.nest_copies.iter().map(|c| [c.pivot[0].to_bits(), c.pivot[1].to_bits(), c.angle.to_bits(), c.shift[0].to_bits(), c.shift[1].to_bits()]).collect::<Vec<_>>()));
         if pk != self.prog_key || self.sim.is_none() {
             let mut prog = Program::parse(code, inp.settings);
-            if self.source == Source::Step {
-                prog.translate(inp.step_origin);
+            match self.source {
+                Source::Step => prog.translate(inp.step_origin),
+                Source::Nest => prog.translate(inp.nest_origin),
+                Source::File => {}
             }
             self.prog_key = pk;
             self.rebuild(inp, prog);
             return;
         }
         let stock = self.stock_now(inp);
-        let sk = hash_of((pk, stock.map(|(a, b)| (bits(a), bits(b))), self.detail, inp.model.map(|m| bits(m.min)), inp.model.map(|m| m.faces.len())));
+        let sk = hash_of((pk, stock.map(|(a, b)| (bits(a), bits(b))), self.detail, inp.model.map(|m| bits(m.min)), inp.model.map(|m| m.faces.len()), inp.stock_tris.map(|t| (t.len(), t.first().map(|t| bits(t[0]))))));
         if sk != self.sim_key {
             let prog = self.sim.take().map(|s| s.prog).unwrap_or_default();
             self.rebuild(inp, prog);
@@ -260,7 +278,7 @@ impl SimTab {
         self.compare_cache = None;
         self.part = None;
         let pk = self.prog_key;
-        self.sim_key = hash_of((pk, stock.map(|(a, b)| (bits(a), bits(b))), self.detail, inp.model.map(|m| bits(m.min)), inp.model.map(|m| m.faces.len())));
+        self.sim_key = hash_of((pk, stock.map(|(a, b)| (bits(a), bits(b))), self.detail, inp.model.map(|m| bits(m.min)), inp.model.map(|m| m.faces.len()), inp.stock_tris.map(|t| (t.len(), t.first().map(|t| bits(t[0]))))));
         let Some((lo, hi)) = stock else {
             self.sim = Some(Sim::new(prog, [0.0; 3], [1.0, 1.0, 0.0], 2));
             return;
@@ -269,10 +287,26 @@ impl SimTab {
             self.stock = (lo, hi);
         }
         let first = self.sim.is_none() || self.sim.as_ref().is_some_and(|s| s.prog.pieces.is_empty());
-        let sim = Sim::new(prog, lo, hi, self.detail.cells());
-        if self.source == Source::Step {
-            if let Some(m) = inp.model {
-                self.part = Some(sim.map.surface_of(crate::sim::top_tris(m)));
+        let mut sim = Sim::new(prog, lo, hi, self.detail.cells());
+        if let (false, Some(tris)) = (self.custom_stock, inp.stock_tris) {
+            match self.source {
+                Source::Step => sim = sim.with_stock(tris),
+                Source::Nest => {
+                    let all: Vec<[P3; 3]> = inp.nest_copies.iter().flat_map(|c| tris.iter().map(move |t| t.map(|p| c.apply3(p)))).collect();
+                    sim = sim.with_stock(&all);
+                }
+                Source::File => {}
+            }
+        }
+        if let Some(m) = inp.model {
+            match self.source {
+                Source::Step => self.part = Some(sim.map.surface_of(crate::sim::top_tris(m))),
+                // every copy of the part
+                Source::Nest => {
+                    let tris: Vec<[P3; 3]> = inp.nest_copies.iter().flat_map(|c| crate::sim::top_tris(m).map(move |t| t.map(|p| c.apply3(p)))).collect();
+                    self.part = Some(sim.map.surface_of(tris.iter()));
+                }
+                Source::File => {}
             }
         }
         self.target = keep.min(sim.prog.total);
@@ -305,7 +339,11 @@ impl SimTab {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, inp: &Inputs) {
         self.sync(inp);
-        self.origin = (self.source == Source::Step).then_some(inp.step_origin);
+        self.origin = match self.source {
+            Source::Step => Some(inp.step_origin),
+            Source::Nest => Some(inp.nest_origin),
+            Source::File => None,
+        };
         let total = self.sim.as_ref().map_or(0.0, |s| s.prog.total);
 
         // --- playback clock
@@ -381,6 +419,9 @@ impl SimTab {
             ui.label("Simulate:");
             let before = self.source;
             ui.selectable_value(&mut self.source, Source::Step, "Step milling");
+            ui.add_enabled_ui(!inp.nest_code.is_empty(), |ui| {
+                ui.selectable_value(&mut self.source, Source::Nest, "Nest").on_disabled_hover_text("Open the Nest tab first (or fix its errors)");
+            });
             ui.add_enabled_ui(!self.file_code.is_empty(), |ui| {
                 ui.selectable_value(&mut self.source, Source::File, if self.file_name.is_empty() { "File".to_string() } else { self.file_name.clone() });
             });
@@ -472,6 +513,7 @@ impl SimTab {
         if prog.pieces.is_empty() {
             ui.weak(match self.source {
                 Source::Step => "No step milling G-code yet - import a model and add operations (or fix the errors on the Step Milling tab).",
+                Source::Nest => "No nested G-code yet - see the Nest tab.",
                 Source::File => "The file has no moves.",
             });
             return;
@@ -1022,10 +1064,10 @@ mod tests {
         let job = StepJob { ops: vec![StepOp { enabled: true, kind: OpKind::Rough(op) }], ..Default::default() };
         let s = Settings { safe_z: 25.0, ..Default::default() };
         let code = generate(&job, &s).unwrap();
-        let inp = Inputs { step_code: &code, settings: &s, model: Some(&model), step_stock: Some(stock), step_origin: [0.0; 3] };
+        let inp = Inputs { step_code: &code, settings: &s, model: Some(&model), step_stock: Some(stock), step_origin: [0.0; 3], nest_code: "", nest_stock: None, nest_origin: [0.0; 3], nest_copies: &[], stock_tris: None };
         let ctx = egui::Context::default();
         let mut tab = SimTab::default();
-        let mut frame = |tab: &mut SimTab| {
+        let frame = |tab: &mut SimTab| {
             let _ = ctx.run(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 850.0))), ..Default::default() }, |ctx| {
                 egui::SidePanel::right("code").show(ctx, |ui| tab.code_panel(ui));
                 egui::CentralPanel::default().show(ctx, |ui| tab.ui(ui, &inp));

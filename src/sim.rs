@@ -594,6 +594,21 @@ impl Sim {
         Sim { prog, snaps: vec![(0, map.clone())], map, done: 0, partial: 0.0, stock_volume, events: BTreeMap::new(), snap_every, version: 0 }
     }
 
+    /// Start from the stock shape `tris` (the top surface over each cell;
+    /// cells it does not cover hold no stock) instead of the full box.
+    pub fn with_stock(mut self, tris: &[[P3; 3]]) -> Sim {
+        let m = &mut self.map;
+        let top = crate::stock::surface(tris, m.x0, m.y0, m.cell, m.nx, m.ny);
+        let (lo, hi) = (m.bottom as f32, m.top as f32);
+        for (z, t) in m.z.iter_mut().zip(top) {
+            *z = if t > f32::NEG_INFINITY { t.clamp(lo, hi) } else { lo };
+        }
+        self.stock_volume = self.map.volume();
+        self.snaps = vec![(0, self.map.clone())];
+        self.version += 1;
+        self
+    }
+
     pub fn time(&self) -> f64 {
         match self.prog.pieces.get(self.done) {
             Some(p) => p.t0 + p.dt * self.partial,

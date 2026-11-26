@@ -28,6 +28,24 @@ pub enum Strategy {
     Mixed,
 }
 
+/// Which way a profile runs round a wall.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CutDir {
+    /// Climb milling (with a clockwise spindle, M3).
+    #[default]
+    Climb,
+    Conventional,
+}
+
+impl CutDir {
+    pub fn name(self) -> &'static str {
+        match self {
+            CutDir::Climb => "Climb",
+            CutDir::Conventional => "Conventional",
+        }
+    }
+}
+
 /// How a facing pass covers the area.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FacingPattern {
@@ -159,6 +177,11 @@ pub struct PocketOp {
     /// loop (round the outer boundary), standard passes for the rest.
     #[serde(skip)]
     pub adaptive_outer_only: bool,
+    /// Roughing, standard: where the area is only the band round the
+    /// part's outside (no wider than one cutter), one pass per layer round
+    /// the part at the wall contour, this way.
+    #[serde(skip)]
+    pub outside_pass: Option<CutDir>,
 }
 
 impl Default for PocketOp {
@@ -187,6 +210,7 @@ impl Default for PocketOp {
             no_contour: false,
             open_outer: false,
             adaptive_outer_only: false,
+            outside_pass: None,
         }
     }
 }
@@ -253,11 +277,17 @@ pub struct RoughOp {
     pub inside_only: bool,
     /// Pattern of the facing pass over stock taller than the part.
     pub facing: FacingPattern,
+    /// Standard strategy: which way the single pass per layer round the
+    /// part's outside runs.
+    pub outside_dir: CutDir,
     /// Model faces seen from above - kept in sync with the model.
     pub faces: Vec<RoughFace>,
     /// Stock extents in XY (min x, min y, max x, max y) - kept in sync with
     /// the stock. Stock above the part top is faced over all of it.
     pub stock_region: [f64; 4],
+    /// A stock model: only the stock it has is cut (set at generation).
+    #[serde(skip)]
+    pub stock_shape: Option<std::sync::Arc<crate::stock::StockShape>>,
 }
 
 impl Default for RoughOp {
@@ -279,8 +309,10 @@ impl Default for RoughOp {
             finish_layers: true,
             inside_only: false,
             facing: FacingPattern::Unidirectional,
+            outside_dir: CutDir::Climb,
             faces: vec![],
             stock_region: [0.0; 4],
+            stock_shape: None,
         }
     }
 }
@@ -361,6 +393,8 @@ pub struct ProfileOp {
     pub ramp_angle: f64,
     pub start_z: f64,
     pub depth_per_pass: f64,
+    /// Inside / outside a closed loop: which way it runs (every layer the same).
+    pub direction: CutDir,
 }
 
 impl Default for ProfileOp {
@@ -378,6 +412,7 @@ impl Default for ProfileOp {
             ramp_angle: 3.0,
             start_z: 0.0,
             depth_per_pass: 1.0,
+            direction: CutDir::Climb,
         }
     }
 }
@@ -791,6 +826,11 @@ pub struct StepJob {
     /// Where the imported model sits in machine coordinates.
     pub placement: crate::step::Placement,
     pub stock: Stock,
+    /// A STEP model as the stock instead of the box (when its path is set).
+    pub stock_model: crate::stock::StockModel,
+    /// The stock model, loaded and placed (set by whoever loads the job).
+    #[serde(skip)]
+    pub stock_shape: Option<std::sync::Arc<crate::stock::StockShape>>,
     /// Rapid plane height above the stock or part top, whichever is higher.
     pub rapid_above: f64,
     /// Program zero: every X / Y / Z in the G-code is relative to it.
@@ -800,7 +840,32 @@ pub struct StepJob {
 
 impl Default for StepJob {
     fn default() -> Self {
-        StepJob { step_path: String::new(), placement: Default::default(), stock: Default::default(), rapid_above: 10.0, origin: Default::default(), ops: vec![] }
+        StepJob { step_path: String::new(), placement: Default::default(), stock: Default::default(), stock_model: Default::default(), stock_shape: None, rapid_above: 10.0, origin: Default::default(), ops: vec![] }
+    }
+}
+
+impl StepJob {
+    /// The stock box (min, max) round a part with bounding box `min`..`max`:
+    /// the stock model's, when there is one.
+    pub fn stock_box(&self, min: P3, max: P3) -> (P3, P3) {
+        match &self.stock_shape {
+            Some(s) if self.stock_model.is_set() => (s.min, s.max),
+            _ => self.stock.bounds(min, max),
+        }
+    }
+
+    /// Problems with the stock compared with the part.
+    pub fn stock_issues(&self, min: P3, max: P3) -> Vec<String> {
+        if !self.stock_model.is_set() {
+            return self.stock.issues(min, max);
+        }
+        let Some(s) = &self.stock_shape else { return vec![format!("stock model {} is not loaded", self.stock_model.path)] };
+        let out = (0..3).any(|k| s.min[k] > min[k] + 1e-3 || s.max[k] < max[k] - 1e-3);
+        if out {
+            vec!["the part pokes out of the stock model - check its position (Shift)".into()]
+        } else {
+            vec![]
+        }
     }
 }
 
@@ -1848,6 +1913,22 @@ fn pocket_moves(op: &PocketOp, retract: f64, from: P2) -> Result<Vec<Mv>, String
             }
         }
     }
+    // the band round the outside, one cutter wide: a single pass round the
+    // part per layer, at the wall contour, always the same way
+    let mut single_outside = false;
+    if let (Some(dir), true, true) = (op.outside_pass, op.open_outer, centre.is_empty() && troch_r == 0.0) {
+        if offset_region(&op.outer, &islands, rough0 + 2.0 * OPEN_EDGE + 1e-3).is_empty() {
+            for l in allowed.iter().filter(|l| signed_area(l) < 0.0) {
+                // round the part: CW = climb with M3
+                let mut l = l.clone();
+                if dir == CutDir::Conventional {
+                    l.reverse();
+                }
+                centre.push((0, l, LoopCut::Plain));
+            }
+            single_outside = !centre.is_empty();
+        }
+    }
     if centre.is_empty() {
         let mut k = 0;
         loop {
@@ -1923,7 +2004,8 @@ fn pocket_moves(op: &PocketOp, retract: f64, from: P2) -> Result<Vec<Mv>, String
 
     // finishing pass on all walls, each level top-down (roughing: only the
     // part's walls, or none)
-    let finish_loops: Vec<Vec<P2>> = if op.no_contour {
+    // (a single outside pass is the contour)
+    let finish_loops: Vec<Vec<P2>> = if op.no_contour || single_outside {
         vec![]
     } else {
         finish_loops.into_iter().filter(|l| !(op.open_outer && signed_area(l) > 0.0)).collect()
@@ -2410,8 +2492,14 @@ pub fn profile_paths(op: &ProfileOp) -> Result<Vec<Vec<P2>>, String> {
         .filter(|l| signed_area(l) >= 0.0 || op.side == ProfileSide::Center)
         .map(|l| {
             let mut v = start_near(&l, first);
-            if op.side == ProfileSide::Outside {
-                v.reverse(); // CW around the outside = climb with M3
+            // with M3: CW round the outside and CCW round the inside climb
+            let cw = match op.side {
+                ProfileSide::Outside => op.direction == CutDir::Climb,
+                ProfileSide::Inside => op.direction == CutDir::Conventional,
+                ProfileSide::Center => false,
+            };
+            if cw {
+                v.reverse();
             }
             v
         })
@@ -2478,13 +2566,19 @@ fn profile_moves(op: &ProfileOp, retract: f64) -> Result<Vec<Mv>, String> {
         out.reposition(retract, seq[0], op.start_z + 0.5_f64.min(retract - op.start_z));
         out.feed([seq[0][0], seq[0][1], op.start_z], (op.feed * 0.3).max(1.0));
         let mut z_prev = op.start_z;
+        // (closed loops: how far the last layer's ramp ran above its depth)
+        let mut wedge = 0.0;
         for z in levels(op.start_z, op.z, op.depth_per_pass) {
             let ramp = (z_prev - z) / tan;
             let z_of = |d: f64| (z_prev - d * tan).max(z);
             if closed {
-                // ramp down round the loop, then a full loop at depth, ending at the start
-                let dist = ((ramp + len) / len - 1e-9).ceil() * len;
-                walk(&mut out, &seq, true, dist, &z_of, op.feed);
+                // one lap per layer, ramping down in its first part (more
+                // laps only if the ramp is longer than the loop), always
+                // the same way round; the next layer's ramp takes out what
+                // this one's left
+                let laps = (ramp / len - 1e-9).ceil().max(1.0);
+                walk(&mut out, &seq, true, laps * len, &z_of, op.feed);
+                wedge = ramp - (laps - 1.0) * len;
             } else {
                 // ramp back and forth, then a full pass at depth ending at an end
                 let passes = (ramp / len - 1e-9).ceil().max(0.0) + 1.0;
@@ -2494,6 +2588,11 @@ fn profile_moves(op: &ProfileOp, retract: f64) -> Result<Vec<Mv>, String> {
                 }
             }
             z_prev = z;
+        }
+        if closed && wedge > 1e-9 {
+            // the last ramp, again at depth
+            let z = op.z;
+            walk(&mut out, &seq, true, wedge.min(len), &|_| z, op.feed);
         }
         out.rapid([out.pos[0], out.pos[1], retract]);
     }
@@ -2777,6 +2876,16 @@ pub fn rough_layer_in(op: &RoughOp, geom: &RoughGeom, z: f64) -> Result<RoughLay
         } else {
             (geom.grown.difference(&keep), geom.grown.clone())
         };
+        // a stock model: only where it has stock above the layer, the
+        // clearing reaching a tool diameter (+ stock to leave) past it, so
+        // the tool fits round a thin skin and cuts out past its edge
+        let (cut, limit) = match &op.stock_shape {
+            Some(sh) => {
+                let reach = offset_multi(&sh.shadow(z + 1e-3), -(op.cutter.dia() + a + OPEN_EDGE));
+                (cut.intersection(&reach), limit.intersection(&reach))
+            }
+            None => (cut, limit),
+        };
         let floored = cut.difference(&geom.voids);
         (cut, floored, limit)
     }))
@@ -2870,6 +2979,17 @@ fn rough_moves(op: &RoughOp, retract: f64) -> Result<Vec<Mv>, String> {
             // (inside only: tool centres out to a radius past the outline,
             // as far as the layers' centres go round a chamfer or fillet)
             let band = if op.inside_only { grow_loops(&outline, r + a) } else { grow_loops(&outline, r + a + OPEN_EDGE + op.band_extra()) };
+            // a stock model: tool centres out to a radius past its stock above
+            // the faced height (outside it the layers below hop over nothing)
+            let band = match &op.stock_shape {
+                Some(sh) => {
+                    use geo::BooleanOps;
+                    let reach = offset_multi(&sh.shadow(fz + 1e-3), -(r + OPEN_EDGE));
+                    let b = geo::MultiPolygon::new(even_odd_regions(&band).iter().map(|(o, i)| to_geo(o, i)).collect()).intersection(&reach);
+                    b.0.iter().flat_map(|p| std::iter::once(from_geo_ring(p.exterior())).chain(p.interiors().iter().map(from_geo_ring))).filter(|l| l.len() >= 3).collect()
+                }
+                None => band,
+            };
             // and a lap round its edge: the layers below may hop just above it
             out.extend(facing_moves(&band, &band, FacingCut { edge_lap: true, ..cut }, retract));
         }
@@ -2927,8 +3047,11 @@ fn rough_moves(op: &RoughOp, retract: f64) -> Result<Vec<Mv>, String> {
         for (o, i) in regions {
             // (checked to a micron: the tool may leave from the wall contour,
             // corners and all)
-            let safe: Vec<Vec<Vec<P2>>> = vec![offset_region(&o, &i, r + a)].into_iter().filter(|l| !l.is_empty()).collect();
             let open = o.iter().take(3).all(|&p| boundary_dist(&layer.limit, p) < 1e-4);
+            // (an open outer edge cut by the single standard pass: the strip
+            // it leaves there, OPEN_EDGE wide, is not counted)
+            let o_safe = if open && op.strategy == Strategy::Standard { offset_region(&o, &[], OPEN_EDGE).into_iter().find(|l| signed_area(l) > 0.0).unwrap_or_default() } else { o.clone() };
+            let safe: Vec<Vec<Vec<P2>>> = vec![offset_region(&o_safe, &i, r + a)].into_iter().filter(|l| !l.is_empty()).collect();
             jobs.push(RJob { layer: k, bbox: bbox_of(std::slice::from_ref(&o)), area: geo::MultiPolygon::new(vec![to_geo(&o, &i)]), cut: Cut::Clear(o, i, open), safe, deps: vec![] });
         }
     }
@@ -3001,6 +3124,7 @@ fn rough_moves(op: &RoughOp, retract: f64) -> Result<Vec<Mv>, String> {
                     cutter: op.cutter,
                     stepover_pct: op.stepover_pct,
                     adaptive_outer_only: op.strategy == Strategy::Mixed,
+                    outside_pass: (strategy == Strategy::Standard && op.strategy == Strategy::Standard).then_some(op.outside_dir),
                     feed: op.feed,
                     speed: op.speed,
                     ramp_angle: op.ramp_angle,
@@ -3542,7 +3666,48 @@ pub fn validate(op: &StepOp, s: &Settings, tabs_top: f64) -> Vec<String> {
     e
 }
 
+/// `op` with the job's stock model (roughing only cuts the stock it has).
+fn with_stock(mut op: RoughOp, job: &StepJob) -> RoughOp {
+    if job.stock_model.is_set() {
+        op.stock_shape = job.stock_shape.clone();
+    }
+    op
+}
+
 pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
+    generate_at(job, s, &[Placed::default()], job.origin.at)
+}
+
+/// Where a copy of the part goes (XY, model coordinates): turned by
+/// `angle` (radians, anticlockwise) about `pivot`, then moved by `shift`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Placed {
+    pub pivot: P2,
+    pub angle: f64,
+    pub shift: P2,
+}
+
+impl Placed {
+    pub fn apply(&self, p: P2) -> P2 {
+        let (sn, cs) = self.angle.sin_cos();
+        let d = [p[0] - self.pivot[0], p[1] - self.pivot[1]];
+        [self.pivot[0] + cs * d[0] - sn * d[1] + self.shift[0], self.pivot[1] + sn * d[0] + cs * d[1] + self.shift[1]]
+    }
+    pub fn apply3(&self, p: P3) -> P3 {
+        let q = self.apply([p[0], p[1]]);
+        [q[0], q[1], p[2]]
+    }
+}
+
+/// The program for copies of the part placed by `copies` (one default
+/// placement = the part as programmed), relative to program zero `origin`.
+/// Each op is cut on every copy in turn (nearest next), so the tools change
+/// once per op, not per copy. Turning a copy keeps its cuts climb / conventional.
+pub fn generate_at(job: &StepJob, s: &Settings, copies: &[Placed], origin: P3) -> Result<String, Vec<String>> {
+    let offsets = copies;
+    if offsets.is_empty() {
+        return Err(vec!["nothing to cut: no copies of the part".into()]);
+    }
     let tabs: Vec<&MillTab> = job
         .ops
         .iter()
@@ -3572,6 +3737,9 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
         let name = std::path::Path::new(&job.step_path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         w.line(format!("(model {})", name.replace(['(', ')'], "")));
     }
+    if offsets.len() > 1 {
+        w.line(format!("({} copies of the part)", offsets.len()));
+    }
     for t in &tabs {
         w.line(format!("(mill tab X{} Y{} Z{} to Z{} {}x{})", fmt(t.center[0]), fmt(t.center[1]), fmt(t.center[2]), fmt(t.top()), fmt(t.width), fmt(t.depth)));
     }
@@ -3588,7 +3756,17 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
             let g = &th.group;
             // (holes in an omitted area are left)
             let bottom = g.start_z - g.hole_depth();
-            let locs: Vec<(f64, f64)> = g.parse_locations().unwrap_or_default().into_iter().filter(|&(x, y)| !fills.iter().any(|f| f.top > bottom + 1e-6 && f.covers([x, y]))).collect();
+            let one: Vec<(f64, f64)> = g.parse_locations().unwrap_or_default().into_iter().filter(|&(x, y)| !fills.iter().any(|f| f.top > bottom + 1e-6 && f.covers([x, y]))).collect();
+            // every copy's holes in one go
+            let locs: Vec<(f64, f64)> = offsets
+                .iter()
+                .flat_map(|o| {
+                    one.iter().map(move |&(x, y)| {
+                        let q = o.apply([x, y]);
+                        (q[0], q[1])
+                    })
+                })
+                .collect();
             if locs.is_empty() {
                 continue;
             }
@@ -3627,7 +3805,7 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
                     Err(e) => return Err(vec![format!("op {}: {e}", i + 1)]),
                 },
             },
-            OpKind::Rough(r) => match rough_moves(&rough_with_keepouts(&rough_with_fills(r, &fills), &holes), retract) {
+            OpKind::Rough(r) => match rough_moves(&with_stock(rough_with_keepouts(&rough_with_fills(r, &fills), &holes), job), retract) {
                 Ok(m) => m,
                 Err(e) => return Err(vec![format!("op {}: {e}", i + 1)]),
             },
@@ -3664,49 +3842,63 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
         w.line(String::new());
         w.change(s, t, &tool_desc, speed);
         w.line(format!("(op {}: {})", i + 1, op.label()));
-        w.line(format!("G0 Z{}", fmt(s.safe_z)));
-        // go to the op's first point at the rapid plane: the moves start there
-        w.line(format!("G0 X{} Y{}", fmt(start[0]), fmt(start[1])));
+        // each copy, nearest first
+        let mut left: Vec<(usize, Placed)> = offsets.iter().copied().enumerate().collect();
+        let s2 = [start[0], start[1]];
+        while !left.is_empty() {
+            let k = (0..left.len()).min_by(|&a, &b| d2(left[a].1.apply(s2), here).total_cmp(&d2(left[b].1.apply(s2), here))).unwrap();
+            let (n, o) = left.remove(k);
+            if offsets.len() > 1 {
+                w.line(format!("(copy {})", n + 1));
+            }
+            let at = |p: P3| o.apply3(p);
+            let start = at(start);
+            w.line(format!("G0 Z{}", fmt(s.safe_z)));
+            // go to the op's first point at the rapid plane: the moves start there
+            w.line(format!("G0 X{} Y{}", fmt(start[0]), fmt(start[1])));
 
-        let mut pos = start;
-        let mut last_f = -1.0;
-        for m in moves {
-            match m {
-                Mv::Rapid(p) => {
-                    let xy = (p[0] - pos[0]).abs() > 1e-9 || (p[1] - pos[1]).abs() > 1e-9;
-                    let zc = (p[2] - pos[2]).abs() > 1e-9;
-                    if zc && p[2] > pos[2] {
-                        w.line(format!("G0 Z{}", fmt(p[2])));
-                    }
-                    if xy {
-                        w.line(format!("G0 X{} Y{}", fmt(p[0]), fmt(p[1])));
-                    }
-                    if zc && p[2] < pos[2] {
-                        w.line(format!("G0 Z{}", fmt(p[2])));
-                    }
-                    pos = p;
-                }
-                Mv::Feed(p, f) => {
-                    let mut cmd = String::from("G1");
-                    for (k, a) in ["X", "Y", "Z"].iter().enumerate() {
-                        if (p[k] - pos[k]).abs() > 1e-9 {
-                            cmd.push_str(&format!(" {a}{}", fmt(p[k])));
+            let mut pos = start;
+            let mut last_f = -1.0;
+            for m in &moves {
+                match *m {
+                    Mv::Rapid(p) => {
+                        let p = at(p);
+                        let xy = (p[0] - pos[0]).abs() > 1e-9 || (p[1] - pos[1]).abs() > 1e-9;
+                        let zc = (p[2] - pos[2]).abs() > 1e-9;
+                        if zc && p[2] > pos[2] {
+                            w.line(format!("G0 Z{}", fmt(p[2])));
                         }
+                        if xy {
+                            w.line(format!("G0 X{} Y{}", fmt(p[0]), fmt(p[1])));
+                        }
+                        if zc && p[2] < pos[2] {
+                            w.line(format!("G0 Z{}", fmt(p[2])));
+                        }
+                        pos = p;
                     }
-                    if cmd == "G1" {
-                        continue;
+                    Mv::Feed(p, f) => {
+                        let p = at(p);
+                        let mut cmd = String::from("G1");
+                        for (k, a) in ["X", "Y", "Z"].iter().enumerate() {
+                            if (p[k] - pos[k]).abs() > 1e-9 {
+                                cmd.push_str(&format!(" {a}{}", fmt(p[k])));
+                            }
+                        }
+                        if cmd == "G1" {
+                            continue;
+                        }
+                        if (f - last_f).abs() > 1e-9 {
+                            cmd.push_str(&format!(" F{}", fmt(f)));
+                            last_f = f;
+                        }
+                        w.line(cmd);
+                        pos = p;
                     }
-                    if (f - last_f).abs() > 1e-9 {
-                        cmd.push_str(&format!(" F{}", fmt(f)));
-                        last_f = f;
-                    }
-                    w.line(cmd);
-                    pos = p;
                 }
             }
+            here = [pos[0], pos[1]];
+            w.line(format!("G0 Z{}", fmt(s.safe_z)));
         }
-        here = [pos[0], pos[1]];
-        w.line(format!("G0 Z{}", fmt(s.safe_z)));
     }
     w.line(String::new());
     w.line("M5".into());
@@ -3714,7 +3906,7 @@ pub fn generate(job: &StepJob, s: &Settings) -> Result<String, Vec<String>> {
     w.line(format!("G0 Z{}", fmt(s.safe_z)));
     w.line("M30".into());
     w.line("%".into());
-    Ok(shift_code(&w.s, job.origin.at))
+    Ok(shift_code(&w.s, origin))
 }
 
 /// Program text with tool / spindle state.
@@ -3770,6 +3962,8 @@ mod tests {
             step_path: String::new(),
             placement: Default::default(),
             stock: Default::default(),
+            stock_model: Default::default(),
+            stock_shape: None,
             origin: Default::default(),
             rapid_above: 10.0,
             ops: vec![StepOp {
@@ -3857,6 +4051,8 @@ mod tests {
             step_path: String::new(),
             placement: Default::default(),
             stock: Default::default(),
+            stock_model: Default::default(),
+            stock_shape: None,
             origin: Default::default(),
             rapid_above: 10.0,
             ops: vec![StepOp {
@@ -3926,7 +4122,7 @@ mod tests {
         assert!(closed);
         ops.push(StepOp { enabled: true, kind: OpKind::Tab(MillTab { center: [30.0, 10.0, -4.0], edges: chain, ..Default::default() }) });
         assert_eq!(ops.len(), 4); // face, 2 pockets, tab
-        let job = StepJob { step_path: "testdata/pocket_block.step".into(), placement: Default::default(), stock: Default::default(), rapid_above: 10.0, origin: Default::default(), ops };
+        let job = StepJob { step_path: "testdata/pocket_block.step".into(), placement: Default::default(), stock: Default::default(), rapid_above: 10.0, origin: Default::default(), ops, ..Default::default() };
         let code = generate(&job, &Settings::default()).expect("valid program");
         let pts = feed_points(&code);
         // round hole (r=4 at 52,32) pocketed to -3 without touching its wall
@@ -3944,6 +4140,8 @@ mod tests {
             step_path: String::new(),
             placement: Default::default(),
             stock: Default::default(),
+            stock_model: Default::default(),
+            stock_shape: None,
             origin: Default::default(),
             rapid_above: 10.0,
             ops: vec![StepOp {
@@ -5653,5 +5851,181 @@ mod facing_pattern_tests {
             let inset = |l: &Vec<P2>| l.iter().map(|p| p[0].min(p[1]).min(30.0 - p[0]).min(20.0 - p[1])).fold(f64::INFINITY, f64::min);
             assert!(runs.iter().all(|l| inset(l) >= inset(&runs[0]) - 1e-9) && inset(&runs[1]) > inset(&runs[0]));
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_pass_tests {
+    use super::*;
+
+    /// Feed length in XY and the signed area swept (CCW > 0).
+    fn feeds(moves: &[Mv]) -> (f64, f64, Vec<f64>) {
+        let (mut pos, mut len, mut area, mut zs) = ([0.0; 3], 0.0, 0.0, vec![]);
+        for m in moves {
+            let p = match m {
+                Mv::Feed(p, _) | Mv::Rapid(p) => *p,
+            };
+            if let Mv::Feed(..) = m {
+                len += d2([pos[0], pos[1]], [p[0], p[1]]);
+                area += (pos[0] - 10.0) * (p[1] - 10.0) - (p[0] - 10.0) * (pos[1] - 10.0);
+                zs.push(p[2]);
+            }
+            pos = p;
+        }
+        (len, area / 2.0, zs)
+    }
+
+    #[test]
+    fn closed_profile_is_one_lap_per_layer_always_the_same_way() {
+        let sq = vec![[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]];
+        for (side, dir, ccw) in [
+            (ProfileSide::Outside, CutDir::Climb, false),
+            (ProfileSide::Outside, CutDir::Conventional, true),
+            (ProfileSide::Inside, CutDir::Climb, true),
+            (ProfileSide::Inside, CutDir::Conventional, false),
+        ] {
+            let op = ProfileOp { path: sq.clone(), closed: true, side, direction: dir, z: -3.0, start_z: 0.0, depth_per_pass: 1.0, cutter: Cutter::C3x17, ramp_angle: 3.0, ..Default::default() };
+            let lap = path_len(&profile_paths(&op).unwrap()[0]);
+            let (len, area, zs) = feeds(&profile_moves(&op, 5.0).unwrap());
+            // three layers of one lap, and the last ramp again at depth
+            let ramp = 1.0 / 3f64.to_radians().tan();
+            assert!((len - (3.0 * lap + ramp)).abs() < 0.5, "{side:?} {dir:?}: {len} for laps of {lap}");
+            assert_eq!(area > 0.0, ccw, "{side:?} {dir:?}");
+            assert!((zs.iter().cloned().fold(f64::INFINITY, f64::min) + 3.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn rough_goes_round_the_outside_once_per_layer() {
+        let m = crate::step::parse_model(include_str!("../testdata/bracket.step")).unwrap();
+        let stock = Stock { x: 6.0, y: 6.0, z: 0.0, ..Default::default() }.bounds(m.min, m.max);
+        for dir in [CutDir::Climb, CutDir::Conventional] {
+            let op = RoughOp {
+                cutter: Cutter::C3x17,
+                start_z: stock.1[2],
+                bottom_z: m.min[2],
+                faces: rough_faces(&m),
+                stock_region: [stock.0[0], stock.0[1], stock.1[0], stock.1[1]],
+                outside_dir: dir,
+                ..Default::default()
+            };
+            let moves = rough_moves(&op, 15.0).unwrap();
+            // feeds at Z4 round the outside (the bracket is 50 x 30)
+            let (mut pos, mut len, mut turn): (P3, f64, f64) = ([0.0; 3], 0.0, 0.0);
+            for mv in &moves {
+                let p = match mv {
+                    Mv::Feed(p, _) | Mv::Rapid(p) => *p,
+                };
+                if let Mv::Feed(..) = mv {
+                    if (p[2] - 4.0).abs() < 1e-9 && (pos[2] - 4.0).abs() < 1e-9 && (p[0].abs() > 25.5 || p[1].abs() > 15.5) {
+                        len += d2([pos[0], pos[1]], [p[0], p[1]]);
+                        let mut d = p[1].atan2(p[0]) - pos[1].atan2(pos[0]);
+                        d = (d + PI).rem_euclid(TAU) - PI;
+                        turn += d;
+                    }
+                }
+                pos = p;
+            }
+            let laps = turn / TAU;
+            assert!((laps.abs() - 1.0).abs() < 0.05 && len < 200.0, "{dir:?}: {laps} turns, {len} mm");
+            assert_eq!(laps < 0.0, dir == CutDir::Climb, "climb = CW round the outside");
+        }
+    }
+}
+
+#[cfg(test)]
+mod stock_model_tests {
+    use super::*;
+    use crate::stock::StockShape;
+    use std::sync::Arc;
+
+    fn quad(t: &mut Vec<[P3; 3]>, x0: f64, y0: f64, x1: f64, y1: f64, z: f64) {
+        t.push([[x0, y0, z], [x1, y0, z], [x1, y1, z]]);
+        t.push([[x0, y0, z], [x1, y1, z], [x0, y1, z]]);
+    }
+
+    /// A casting for pocket_block (60 x 40, Z-10..0, pocket X15..45 Y10..30
+    /// 4 deep): 1 mm over it all round and on top, the pocket cast to Z-2
+    /// and 2 mm smaller each side. Only its top and base surfaces (the
+    /// stock shape is its top seen from above).
+    fn casting() -> StockShape {
+        let mut t = vec![];
+        let (z, floor) = (1.0, -2.0);
+        quad(&mut t, -1.0, -1.0, 61.0, 12.0, z);
+        quad(&mut t, -1.0, 28.0, 61.0, 41.0, z);
+        quad(&mut t, -1.0, 12.0, 17.0, 28.0, z);
+        quad(&mut t, 43.0, 12.0, 61.0, 28.0, z);
+        quad(&mut t, 17.0, 12.0, 43.0, 28.0, floor);
+        quad(&mut t, -1.0, -1.0, 61.0, 41.0, -10.0);
+        StockShape::from_tris(t, vec![]).unwrap()
+    }
+
+    fn job(shape: Option<StockShape>) -> (StepJob, crate::step::Model) {
+        let m = crate::step::parse_model(include_str!("../testdata/pocket_block.step")).unwrap();
+        let mut job = StepJob { stock: Stock { x: 2.0, y: 2.0, z: 1.0, ..Default::default() }, ..Default::default() };
+        if let Some(s) = shape {
+            job.stock_model = crate::stock::StockModel { path: "casting.step".into(), shift: [0.0; 3] };
+            job.stock_shape = Some(Arc::new(s));
+        }
+        let (smin, smax) = job.stock_box(m.min, m.max);
+        assert!((smax[2] - 1.0).abs() < 1e-9, "{smin:?} {smax:?}");
+        let op = RoughOp { allowance: 0.2, cutter: Cutter::C3x17, start_z: smax[2], bottom_z: m.min[2], faces: rough_faces(&m), stock_region: [smin[0], smin[1], smax[0], smax[1]], ..Default::default() };
+        job.ops = vec![StepOp { enabled: true, kind: OpKind::Rough(op) }];
+        (job, m)
+    }
+
+    fn feeds(code: &str) -> Vec<P3> {
+        let tp = crate::toolpath::parse(code);
+        tp.paths.iter().filter(|p| p.kind != crate::toolpath::MoveKind::Rapid).flat_map(|p| p.pts.iter().map(|q| [q[0] as f64, q[1] as f64, q[2] as f64])).collect()
+    }
+
+    #[test]
+    fn roughing_skips_the_cast_pocket_and_leaves_the_part_at_size() {
+        let s = Settings { safe_z: 15.0, ..Default::default() };
+        let (boxed, m) = job(None);
+        let (cast, _) = job(Some(casting()));
+        let (box_code, cast_code) = (generate(&boxed, &s).unwrap(), generate(&cast, &s).unwrap());
+        // nothing cut in the air of the cast pocket (on the layers above its
+        // floor, more than a tool diameter + stock to leave in from its
+        // walls; entries may come down there)
+        let air = |p: &P3| [0.2, -0.8, -1.8].iter().any(|z| (p[2] - z).abs() < 1e-3) && p[0] > 17.0 + 3.5 && p[0] < 43.0 - 3.5 && p[1] > 12.0 + 3.5 && p[1] < 28.0 - 3.5;
+        assert!(feeds(&box_code).iter().any(air), "the box stock is cut there");
+        let pts: Vec<P3> = feeds(&cast_code).into_iter().filter(|p| air(p)).collect();
+        assert!(pts.is_empty(), "cut in the cast pocket's air: {:?}", &pts[..pts.len().min(20)]);
+        let len = |c: &str| feeds(c).windows(2).map(|w| crate::step::dist(w[0], w[1])).sum::<f64>();
+        assert!(len(&cast_code) < len(&box_code) - 100.0, "cast {} box {}", len(&cast_code), len(&box_code));
+        // simulated from the casting: no rapids through it, the part at size
+        let shape = cast.stock_shape.clone().unwrap();
+        let (lo, hi) = (shape.min, shape.max);
+        let left = |code: &str, from_casting: bool| {
+            let mut sim = crate::sim::Sim::new(crate::sim::Program::parse(code, &s), lo, hi, 250);
+            if from_casting {
+                sim = sim.with_stock(&shape.tris);
+            }
+            while !sim.seek(f64::INFINITY, std::time::Duration::from_secs(60)) {}
+            assert!(!sim.events.values().any(|e| e.kind == crate::sim::EventKind::RapidCut), "{:?}", sim.events);
+            let part = sim.map.surface_of(crate::sim::top_tris(&m));
+            let d: Vec<f32> = sim.map.z.iter().zip(&part).filter(|(_, p)| !p.is_nan()).map(|(z, p)| z - p).collect();
+            assert!(d.iter().all(|&d| d > -0.05), "gouge {}", d.iter().cloned().fold(0f32, f32::min));
+            (d.iter().filter(|&&d| d > 0.3).count(), sim.stock_volume)
+        };
+        let (box_left, box_vol) = left(&box_code, false);
+        let (cast_left, cast_vol) = left(&cast_code, true);
+        assert!(cast_vol < box_vol - 26.0 * 16.0 * 2.5, "casting {cast_vol} box {box_vol}");
+        assert!(cast_left <= box_left + 5, "cells over 0.3 mm left: casting {cast_left}, box {box_left}");
+    }
+
+    #[test]
+    fn a_box_model_cuts_like_the_box_stock() {
+        // the stock box itself as the model: the same band is cut
+        let s = Settings { safe_z: 15.0, ..Default::default() };
+        let mut t = vec![];
+        quad(&mut t, -1.0, -1.0, 61.0, 41.0, 1.0);
+        quad(&mut t, -1.0, -1.0, 61.0, 41.0, -10.0);
+        let (boxed, _) = job(None);
+        let (model, _) = job(Some(StockShape::from_tris(t, vec![]).unwrap()));
+        let (a, b) = (feeds(&generate(&boxed, &s).unwrap()), feeds(&generate(&model, &s).unwrap()));
+        let len = |f: &[P3]| f.windows(2).map(|w| crate::step::dist(w[0], w[1])).sum::<f64>();
+        assert!((len(&a) - len(&b)).abs() < 0.02 * len(&a), "box {} model {}", len(&a), len(&b));
     }
 }

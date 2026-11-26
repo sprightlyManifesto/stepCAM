@@ -497,6 +497,8 @@ pub struct Job {
     pub settings: Settings,
     /// Step milling tab: STEP file + operations.
     pub step: crate::stepmill::StepJob,
+    /// Nest tab: copies of the step milling job on a larger sheet.
+    pub nest: crate::nest::Nest,
 }
 
 impl Job {

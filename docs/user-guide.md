@@ -23,7 +23,7 @@ The G-code updates by itself whenever you change something, so there is no Gener
 
 ## The window
 
-- **Tabs** along the top: **Step Milling**, **Simulator** and **Tools & Settings**. There is also a **❓ Help** button, which opens this guide (F1 does the same).
+- **Tabs** along the top: **Step Milling**, **Nest**, **Simulator** and **Tools & Settings**. There is also a **❓ Help** button, which opens this guide (F1 does the same).
 - **File bar** under the tabs:
   - **Job file:** with **Load** and **Save**.
   - **G-code file:** with **💾 Save G-code**.
@@ -117,6 +117,19 @@ Switching Offset converts the numbers so the stock itself doesn't change. The re
 
 New operations that cut from the top start at the stock top, and follow it when you change the stock.
 
+#### A STEP model as the stock
+
+Pick **STEP model** instead of **Box** to use another STEP file as the stock, for example a casting, a forging, or the part as it came off an earlier setup. Choose the file in the dialog that opens. Its edges are drawn in orange instead of the wire box.
+
+- **Coordinates:** the stock model is read in the same coordinates as the part's STEP file, and the part's placement is applied to it as well, so it lays flat, turns and moves with the part. Export both from the same CAD assembly and they line up.
+- **Shift X / Y / Z** moves the stock model from there. **Centre on part** shifts it so it is centred on the part in X and Y, with its base level with the part's.
+- **Stock box:** the stock model's bounding box takes the box's place for everything that uses it: the stock top that operations start from, the rapid plane, the G-code origin presets and the nest. A warning shows if the part pokes out of the stock model.
+- **Roughing** only cuts where the stock model has material. On each layer it clears the material above that layer, plus a tool diameter (and the stock to leave) past its edge, so the tool fits round a thin skin and cuts out past it. Air is left alone, such as a pocket that is already cast. Stock facing works the same way. The other operations cut as usual.
+- **Simulator:** starts from the stock model's shape, its top surface seen from above, instead of a full block. On the Nest tab, every copy starts as its own stock model.
+- **Change…** picks another file. **Box** goes back to the box stock.
+
+The stock model's path is saved with the job and loaded again when the job is opened. The simulator works from above, so an undercut in the stock model counts as solid down to the base.
+
 ### Rapid plane
 
 **Rapid plane height above stock or part** (default 10 mm) is added to the highest point of the stock or the part, whichever is higher. The resulting Z is shown next to the input. All rapids between cuts and all tool changes happen there.
@@ -163,6 +176,7 @@ Every operation has a **Tool** (from the tool table), **Feed** (mm/min) and **Sp
 
 - **Where it cuts:** each layer clears everything down to that height except the part. This covers pockets, holes, open steps such as the area above a flange, and a band round the part just wide enough for the cutter to run round its outside walls. The band is the part's outline seen from above, offset outwards by half the tool diameter. Stock further out, such as the corners of a square block round a round part, is left alone.
 - **Walls:** the part's walls are profiled at every layer.
+- **Outside** (Standard strategy): where the band round the part's outside is just one cutter wide, each layer is a single pass round the part at the wall contour, always the same way round: **Climb** (default, clockwise with M3) or **Conventional**. Wider areas outside, such as above a flange, are still cleared with offset passes first.
 - **Order:** each area is cut all the way down before the next: the band round the outside through all its layers, then each pocket, step or hole in turn. A layer is cut only once the cuts above it are done. Going down an area, the tool stays on the floor it has just cleared: it feeds across to the next layer's start, or goes straight down where it stands, instead of lifting out. Moves to another area travel 0.5 mm above the deepest layer cleared all along the way, and go up to the retract height only when no layer is clear.
 - **Stock facing:** if the stock is taller than the part, roughing first faces it down to the part top (plus stock to leave) over the same band. The row shows the Z range, or *none*. **Facing** picks its pattern, as for the Face op (see Face below). Except with Spiral, a lap round the band's edge follows the facing.
 - **Slopes and curves:** sloped and curved surfaces (fillets, chamfers, domes) are followed. They are roughed down in steps, and the outline steps in and out with them.
@@ -227,9 +241,9 @@ You can also make a pocket from a closed, level loop of edges (right-click an ed
 Right-click an edge (which selects its loop or chain) and choose **Profile** to cut along it. **Tool position** sets where the tool runs:
 
 - **on centre line:** the tool centre follows the edges. This works on any chain, open or closed.
-- **inside / outside:** the tool is offset by its radius, so the edge of the cut lies on the edges. Closed loops only. Outside runs clockwise and inside runs anticlockwise, both climb.
+- **inside / outside:** the tool is offset by its radius, so the edge of the cut lies on the edges. Closed loops only. **Direction** picks **Climb** (default: clockwise outside the loop, anticlockwise inside it, with M3) or **Conventional**, and every layer runs that way round.
 
-Each depth level ramps down along the path at the **Ramp angle**, then makes a full pass at depth. Open chains ramp back and forth.
+On a closed loop each depth level is one lap: it ramps down at the **Ramp angle** in the first part of the lap and carries on at depth (more laps only if the ramp is longer than the loop). The next layer's ramp takes out what this one's left, and after the last layer the ramp's length is cut again at full depth. Open chains ramp back and forth, so their passes alternate direction.
 
 The default depths come from the model:
 
@@ -316,14 +330,29 @@ Right-click any face of a pocket, hole or step (its floor, a wall, or a hole's w
 - **How ops treat it:** roughing and finishing see solid material up to the fill's top; a pocket inside the area is skipped, and an area inside a pocket becomes an island; threaded holes inside it are left out. Any other cut that would reach into the area goes up over it at its top.
 - A face with no higher flat surface round it, such as the part's top, cannot be omitted.
 
+## Nest tab
+
+The Nest tab lays out copies of the step milling job on a larger sheet of stock, and makes one program that cuts them all. Each copy sits in a box the size of the programmed stock, and can be turned to any angle of its own. By default there is one copy, on a sheet the size of the programmed stock, so the nested program is the step milling program itself.
+
+- **Sheet:** tick **Same size as the programmed stock**, or untick it and type the sheet's **X** and **Y**. Its thickness is always the programmed stock's. The sheet's lower-left corner is where the programmed stock's is.
+- **Grid:** **Columns**, **Rows**, the **Gap** between the copies' footprints, and the **Angle** every copy is laid out at. **Lay out** places them from the sheet's lower-left corner, and grows the sheet if they don't fit. **Fill sheet** fits as many columns and rows as the sheet holds.
+- **Copies:** each copy's position and angle, with **⟳** to turn it 90° clockwise and a 🗑 to remove it. The position is the lower-left corner of the copy's footprint (its stock box as seen from above, turned), from the sheet's. The angle is anticlockwise, about the centre of the copy's stock box, and turning a copy keeps its footprint's centre where it was. **➕ Add copy** puts one to the right of the last, at the same angle, or starts a new row.
+- **In the view:** drag a copy to move it (it settles to the nearest 0.1 mm), and right-click it to turn it 90° clockwise. Each copy's number sits at its stock's own lower-left corner, with its angle, so you can see which way round it is.
+- **G-code origin:** by default the Step Milling tab's origin modes, applied to the sheet (bottom left of the sheet, say, rather than of one copy). Tick **Own origin** to pick other modes or type a position. The pink cross in the view marks it.
+- **Warnings:** copies that overlap, or that hang off the sheet, are outlined in red and listed.
+- **Program:** every op is cut on all the copies in turn, nearest copy next, so each tool is loaded once. A turned copy's cuts are turned with it, so they stay climb (or conventional) as programmed. Thread milling bores and threads every copy's holes in one go. The program marks each copy with a `(copy n)` comment.
+- **💾 Save nested G-code…** saves it, and **▶ Simulate** opens it in the Simulator tab, which compares the result with every copy of the part. The G-code panel shows the nested program while the Nest tab is open.
+
+The nest is saved with the job.
+
 ## Simulator tab
 
 The Simulator plays a program against the stock and shows the material being cut away.
 
 ### What to simulate
 
-- **Simulate:** **Step milling** (the current program) or a G-code file opened with **📂 Open G-code…**. Tools in a file are looked up in the tool table by number.
-- **Stock:** the step milling stock, or a box round the cutting moves for a file. Tick **Custom stock** to type the box in yourself.
+- **Simulate:** **Step milling** (the current program), **Nest** (the Nest tab's program, once that tab has been opened) or a G-code file opened with **📂 Open G-code…**. Tools in a file are looked up in the tool table by number.
+- **Stock:** the step milling stock (shaped like the stock model, when there is one), the nest's sheet, or a box round the cutting moves for a file. Tick **Custom stock** to type the box in yourself.
 - **Detail:** how fine the simulated stock is: Low, Medium, High or Fine, with 150 to 800 cells along its longer side. Higher detail shows small features better but redraws more slowly.
 - **⟲ Restart:** starts again with fresh stock.
 
@@ -420,6 +449,7 @@ job.open()                               # look at it in stepCAM
 - **part:** a CadQuery Workplane or Shape, in machine coordinates. Move and rotate it in CadQuery to place it on the machine.
 - **stock:** with `stock_offset=True`, the values are added to the part's bounding box. With `False`, they are the absolute stock size. This is the same as the Stock inputs on the Step Milling tab.
 - **stock_z_anchor:** `"bottom"` (default), `"middle"` or `"top"`, the same as **Part in stock**.
+- **A stock model:** pass a CadQuery Workplane or Shape (exported beside the job as `<name>-stock.step`), or the path of a STEP file, as `stock`. It's in the same coordinates as the part. `stock_shift=(x, y, z)` moves it. For example `Job(part, stock=cq.Workplane().box(42, 32, 9, centered=(True, True, False)))`.
 - **origin_xy / origin_z:** the G-code origin.
   - `origin_xy`: `"model"`, `"center"`, `"bottom_left"`, `"bottom_right"`, `"top_left"`, `"top_right"`, or an `(x, y)` pair.
   - `origin_z`: `"model"`, `"stock_top"`, `"stock_base"`, or a Z value.

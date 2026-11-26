@@ -161,6 +161,27 @@ class StepCamTests(unittest.TestCase):
         self.assertEqual(ops[0]["kind"]["Face"]["pattern"], "SquareSpiral")
         self.assertEqual(ops[1]["kind"]["Rough"]["facing"], "Zigzag")
 
+    def test_stock_model(self):
+        part = plate()
+        # a casting: 1 mm over the plate all round and on top, the pocket cast in
+        casting = cq.Workplane().box(42, 32, 9, centered=(True, True, False)).faces(">Z").workplane().rect(16, 6).cutBlind(-2)
+        job = Job(part, stock=casting)
+        job.rough(tool=4)
+        res = job.generate(str(self.out / "c.nc"), simulate={"detail": 200})
+        self.assertEqual(res.stock, {"min": [-21.0, -16.0, 0.0], "max": [21.0, 16.0, 9.0]})
+        j = json.loads(Path(res.job_path).read_text())
+        self.assertTrue(Path(j["step"]["stock_model"]["path"]).is_file())
+        sim = res.simulation
+        self.assertFalse([e for e in sim["events"] if e["kind"] == "rapid_through_material"])
+        # the casting's volume, not the box's
+        self.assertLess(sim["stock_mm3"], 42 * 32 * 9 - 16 * 6 * 2 + 50)
+        self.assertLess(sim["max_gouge"], 0.05)
+        # and a STEP file as the stock, moved
+        job = Job(part, stock=j["step"]["stock_model"]["path"], stock_shift=(0, 0, 1))
+        job.rough(tool=4)
+        res = job.generate(str(self.out / "d.nc"))
+        self.assertEqual(res.stock["max"][2], 10.0)
+
     def test_errors_are_reported(self):
         part = plate()
         job = Job(part)

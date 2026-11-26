@@ -180,6 +180,12 @@ class Job:
     stock:          (x, y, z). With stock_offset=True (default) these are added
                     to the part's bounding box (X/Y split over both sides, Z on
                     top); with False they are the absolute stock size.
+                    Or a stock model: a CadQuery Workplane / Shape (a casting,
+                    the part from an earlier setup), or the path of a STEP
+                    file, in the same coordinates as the part. Roughing then
+                    only cuts where it has stock, and the simulator starts
+                    from its shape.
+    stock_shift:    (x, y, z) to move a stock model by (mm).
     stock_z_anchor: where the part sits in the stock's height: "bottom"
                     (default, part on the stock base, extra stock on top),
                     "middle" or "top" (part top at the stock top).
@@ -201,7 +207,8 @@ class Job:
         self,
         part: Union[cq.Workplane, cq.Shape],
         *,
-        stock: Sequence[float] = (0.0, 0.0, 0.0),
+        stock: Union[Sequence[float], cq.Workplane, cq.Shape, str] = (0.0, 0.0, 0.0),
+        stock_shift: Sequence[float] = (0.0, 0.0, 0.0),
         stock_offset: bool = True,
         stock_z_anchor: str = "bottom",
         rapid_above: float = 10.0,
@@ -213,6 +220,12 @@ class Job:
         binary: Optional[str] = None,
     ):
         self.part = part
+        #: stock model: a CadQuery object (exported at generate()) or a STEP path
+        self.stock_model: Union[cq.Workplane, cq.Shape, str, None] = None
+        self.stock_shift = [float(v) for v in stock_shift]
+        if isinstance(stock, (cq.Workplane, cq.Shape, str, Path)):
+            self.stock_model = str(Path(stock).resolve()) if isinstance(stock, (str, Path)) else stock
+            stock = (0.0, 0.0, 0.0)
         self.stock = {"x": float(stock[0]), "y": float(stock[1]), "z": float(stock[2]), "offset": bool(stock_offset), "z_anchor": stock_z_anchor}
         self.rapid_above = float(rapid_above)
         self.settings_file = settings_file
@@ -285,7 +298,9 @@ class Job:
         ("standard" / "adaptive" / "mixed": trochoids only on the outermost
         loop, standard passes elsewhere), start_z, bottom_z, overcut_z, clear_voids,
         facing (pattern of the stock facing: "unidirectional" / "zigzag" /
-        "spiral" / "square_spiral"), finish_each_layer (default True), inside_only (default False: no cut
+        "spiral" / "square_spiral"), outside_dir ("climb" / "conventional":
+        the single pass per layer round the outside, standard strategy),
+        finish_each_layer (default True), inside_only (default False: no cut
         round the outside profile; the top and outside-edge fillets and
         chamfers are still cleared).
         """
@@ -329,8 +344,9 @@ class Job:
         """Profile along level edge loops / chains (one profile per chain).
         A face selects its outer outline.
 
-        side ("outside" / "inside" / "center"), tool, depth_per_pass,
-        ramp_angle, feed, speed, start_z, bottom_z.
+        side ("outside" / "inside" / "center"), direction ("climb" /
+        "conventional", closed loops inside / outside), tool,
+        depth_per_pass, ramp_angle, feed, speed, start_z, bottom_z.
         """
         es = self._edges(edges, faces_ok=True)
         return self._add("profile", [p for e in es for p in _edge_picks(e)], {"side": side, **params}, enabled=enabled)
@@ -383,9 +399,18 @@ class Job:
         return self._add("tab", [p for e in es for p in _edge_picks(e, at)], params, enabled=enabled)
 
     # -------------------------------------------------------------- output
-    def spec(self, step_path: str, gcode: Optional[str] = None, job: Optional[str] = None, simulate: Union[bool, dict] = False) -> dict:
-        """The `stepcam batch` request for this job."""
+    def spec(
+        self, step_path: str, gcode: Optional[str] = None, job: Optional[str] = None, simulate: Union[bool, dict] = False, stock_path: Optional[str] = None
+    ) -> dict:
+        """The `stepcam batch` request for this job (stock_path: the stock
+        model's STEP file, when the stock is a CadQuery object)."""
         s: dict = {"step": str(step_path), "stock": self.stock, "rapid_above": self.rapid_above, "ops": self.ops}
+        if isinstance(self.stock_model, str):
+            stock_path = self.stock_model
+        if self.stock_model is not None:
+            if stock_path is None:
+                raise ValueError("the stock model needs exporting: pass stock_path")
+            s["stock_model"] = {"path": str(stock_path), "shift": self.stock_shift}
         if self.settings_file:
             s["settings_file"] = str(Path(self.settings_file).resolve())
         if self.settings:
@@ -413,7 +438,7 @@ class Job:
         """Write the G-code (None: keep it in memory, see Result.gcode), the job
         file (default: next to the G-code as <name>.stepcam.json) and the
         part's STEP file (default <name>.step beside the job, which the job
-        refers to).
+        refers to) - and a CadQuery stock model's (<name>-stock.step).
 
         simulate: True or {"detail": 150..2000 cells, "tolerance": mm} runs
         the program through the simulator and fills Result.simulation.
@@ -424,7 +449,11 @@ class Job:
         step_path = Path(step).resolve() if step else job_path.with_name(job_path.name.replace(".stepcam.json", "") + ".step")
         step_path.parent.mkdir(parents=True, exist_ok=True)
         cq.exporters.export(self.part, str(step_path))
-        spec = self.spec(str(step_path), str(base) if gcode else None, str(job_path), simulate)
+        stock_path = None
+        if self.stock_model is not None and not isinstance(self.stock_model, str):
+            stock_path = step_path.with_name(step_path.stem + "-stock.step")
+            cq.exporters.export(self.stock_model, str(stock_path))
+        spec = self.spec(str(step_path), str(base) if gcode else None, str(job_path), simulate, str(stock_path) if stock_path else None)
         proc = subprocess.run([find_binary(self.binary), "batch", "-"], input=json.dumps(spec), capture_output=True, text=True)
         try:
             rep = json.loads(proc.stdout)

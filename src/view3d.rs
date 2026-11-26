@@ -20,6 +20,8 @@ pub struct ModelViz<'a> {
     pub tabs: &'a [MillTab],
     /// Stock box (min, max).
     pub stock: Option<([f64; 3], [f64; 3])>,
+    /// Stock model edges (drawn instead of the box).
+    pub stock_edges: Option<&'a [Vec<[f64; 3]>]>,
     /// Program zero, drawn as a small triad (right-click it for its menu).
     pub origin: Option<[f64; 3]>,
 }
@@ -545,8 +547,14 @@ impl View3d {
                 painter.add(Shape::line(pts, Stroke::new(3.0_f32, SELECT)));
             }
         }
-        // stock as a wire box
-        if let Some((a, b)) = mv.stock {
+        // stock: its model's edges, or a wire box
+        let stock_col = Color32::from_rgba_unmultiplied(230, 160, 60, 200);
+        if let Some(edges) = mv.stock_edges {
+            for e in edges {
+                let pts: Vec<Pos2> = e.iter().map(|&q| self.project(rect, f3(q))).collect();
+                painter.add(Shape::line(pts, Stroke::new(1.2_f32, stock_col)));
+            }
+        } else if let Some((a, b)) = mv.stock {
             let s = Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(230, 160, 60, 200));
             let c = [[a[0], a[1]], [b[0], a[1]], [b[0], b[1]], [a[0], b[1]]];
             let p = |i: usize, z: f64| self.project(rect, [c[i][0] as f32, c[i][1] as f32, z as f32]);

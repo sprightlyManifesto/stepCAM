@@ -6,9 +6,11 @@ mod estimate;
 mod gcode;
 mod help;
 mod model;
+mod nest;
 mod sim;
 mod simview;
 mod step;
+mod stock;
 mod surface;
 mod stepmill;
 mod toolpath;
@@ -48,6 +50,7 @@ fn main() -> eframe::Result<()> {
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     StepMilling,
+    Nest,
     Simulator,
     Settings,
 }
@@ -101,8 +104,23 @@ struct StepCamApp {
     menu_point: Option<[f64; 3]>,
     /// Model faces for roughing (rebuilt when the model changes).
     rough_cache: Option<Vec<stepmill::RoughFace>>,
+    /// Stock model as read from its file (path, model).
+    stock_raw: Option<(String, step::Model)>,
+    /// What the placed stock shape was built from (path, part placement,
+    /// shift), and whether that worked.
+    stock_shape_key: Option<((String, step::Placement, [f64; 3]), bool)>,
     sim: simview::SimTab,
     help: help::Help,
+
+    // nest
+    nest_view: nest::NestView,
+    nest_gcode: String,
+    nest_errors: Vec<String>,
+    /// Estimated run time of `nest_gcode` (s).
+    nest_time: f64,
+    nest_generated_from: Option<(StepJob, Settings, nest::Nest, ([f64; 3], [f64; 3]))>,
+    /// Part outline seen from above, and the model it is of (min, max, faces).
+    nest_outline: Option<(([u64; 3], [u64; 3], usize), Vec<Vec<[f64; 2]>>)>,
 }
 
 impl Default for StepCamApp {
@@ -118,6 +136,8 @@ impl Default for StepCamApp {
             step_model: None,
             set_z_value: 0.0,
             last_stock_top: None,
+            stock_raw: None,
+            stock_shape_key: None,
             last_part_bottom: None,
             last_part_top: None,
             step_gcode: String::new(),
@@ -132,6 +152,12 @@ impl Default for StepCamApp {
             rough_cache: None,
             sim: Default::default(),
             help: Default::default(),
+            nest_view: nest::NestView::new(),
+            nest_gcode: String::new(),
+            nest_errors: Vec::new(),
+            nest_time: 0.0,
+            nest_generated_from: None,
+            nest_outline: None,
         }
     }
 }
@@ -143,12 +169,65 @@ impl StepCamApp {
     }
 
     fn stock_box(&self) -> Option<([f64; 3], [f64; 3])> {
-        self.step_model.as_ref().map(|m| self.job.step.stock.bounds(m.min, m.max))
+        self.step_model.as_ref().map(|m| self.job.step.stock_box(m.min, m.max))
+    }
+
+    /// Load the stock model (once per file) and place it with the part.
+    fn sync_stock_model(&mut self) {
+        let sm = self.job.step.stock_model.clone();
+        if !sm.is_set() {
+            self.job.step.stock_shape = None;
+            return;
+        }
+        let key = (sm.path.clone(), self.job.step.placement, sm.shift);
+        let built = self.stock_shape_key.as_ref().is_some_and(|(k, ok)| k == &key && (!ok || self.job.step.stock_shape.is_some()));
+        if built {
+            return;
+        }
+        if self.stock_raw.as_ref().map(|(p, _)| p) != Some(&sm.path) {
+            match step::load(&sm.path) {
+                Ok(m) => self.stock_raw = Some((sm.path.clone(), m)),
+                Err(e) => {
+                    self.set_status(format!("Could not import the stock model: {e}"), true);
+                    self.job.step.stock_shape = None;
+                    self.stock_shape_key = Some((key, false));
+                    return;
+                }
+            }
+        }
+        let raw = &self.stock_raw.as_ref().unwrap().1;
+        match stock::StockShape::new(raw, &self.job.step.placement, sm.shift) {
+            Ok(shape) => {
+                self.job.step.stock_shape = Some(std::sync::Arc::new(shape));
+                self.stock_shape_key = Some((key, true));
+            }
+            Err(e) => {
+                self.set_status(format!("Stock model {}: {e}", sm.path), true);
+                self.job.step.stock_shape = None;
+                self.stock_shape_key = Some((key, false));
+            }
+        }
+    }
+
+    /// Pick a STEP file as the stock.
+    fn import_stock_model(&mut self) {
+        let Some(path) = rfd::FileDialog::new().set_title("Stock model (STEP)").add_filter("STEP", &["step", "stp", "STEP", "STP"]).add_filter("All files", &["*"]).pick_file() else {
+            return;
+        };
+        let path = path.to_string_lossy().to_string();
+        self.job.step.stock_model = stock::StockModel { path: path.clone(), shift: [0.0; 3] };
+        self.stock_raw = None;
+        self.stock_shape_key = None;
+        self.sync_stock_model();
+        if let Some(s) = &self.job.step.stock_shape {
+            self.set_status(format!("Stock model {path}: {} x {} x {}", gcode::fmt(s.max[0] - s.min[0]), gcode::fmt(s.max[1] - s.min[1]), gcode::fmt(s.max[2] - s.min[2])), false);
+        }
     }
 
     /// Keep operations in step with the stock: facing covers the stock, and
     /// ops that started at the old stock top start at the new one.
     fn sync_stock(&mut self) {
+        self.sync_stock_model();
         let Some((smin, smax)) = self.stock_box() else { return };
         self.job.step.origin.resolve(smin, smax);
         let region = [smin[0], smin[1], smax[0], smax[1]];
@@ -267,6 +346,85 @@ impl StepCamApp {
         }
         self.step_generated_from = Some((self.job.step.clone(), settings));
         true
+    }
+
+    /// Regenerate the nested program if the job or the nest changed.
+    fn regenerate_nest_if_changed(&mut self) {
+        let Some(stock) = self.stock_box() else {
+            self.nest_gcode.clear();
+            self.nest_errors = vec!["import a STEP model first".into()];
+            return;
+        };
+        self.regenerate_step_if_changed();
+        let settings = self.step_settings();
+        let key = (self.job.step.clone(), settings.clone(), self.job.nest.clone(), stock);
+        if self.nest_generated_from.as_ref() == Some(&key) {
+            return;
+        }
+        // one copy as programmed: the step milling program itself
+        let res = if self.job.nest.is_single() {
+            if self.step_errors.is_empty() {
+                Ok(self.step_gcode.clone())
+            } else {
+                Err(self.step_errors.clone())
+            }
+        } else {
+            self.job.nest.code(&self.job.step, &settings, stock)
+        };
+        match res {
+            Ok(code) => {
+                self.nest_time = estimate::estimate(&code, settings.rapid_rate, settings.max_accel);
+                self.nest_gcode = code;
+                self.nest_errors.clear();
+            }
+            Err(e) => {
+                self.nest_gcode.clear();
+                self.nest_errors = e;
+            }
+        }
+        self.nest_generated_from = Some(key);
+    }
+
+    fn nest_tab(&mut self, ui: &mut egui::Ui) {
+        let (Some(stock), Some(model)) = (self.stock_box(), self.step_model.as_ref()) else {
+            ui.weak("Import a STEP model and add operations on the Step Milling tab, then lay out copies of it here.");
+            return;
+        };
+        let mk = (model.min.map(f64::to_bits), model.max.map(f64::to_bits), model.faces.len());
+        if self.nest_outline.as_ref().map_or(true, |(k, _)| *k != mk) {
+            self.nest_outline = Some((mk, stepmill::part_outline(&stepmill::rough_faces(model))));
+        }
+        self.regenerate_nest_if_changed();
+        let cx = nest::Ctx {
+            stock,
+            step_origin: &self.job.step.origin,
+            outline: &self.nest_outline.as_ref().unwrap().1,
+            toolpath: &self.step_toolpath,
+            run_time: self.nest_time,
+            errors: &self.nest_errors,
+        };
+        match self.nest_view.ui(ui, &mut self.job.nest, &cx) {
+            Some(nest::Action::SaveGcode) => self.save_nest_gcode(),
+            Some(nest::Action::Simulate) => {
+                self.sim.source = simview::Source::Nest;
+                self.tab = Tab::Simulator;
+            }
+            None => {}
+        }
+    }
+
+    fn save_nest_gcode(&mut self) {
+        self.regenerate_nest_if_changed();
+        if !self.nest_errors.is_empty() {
+            self.set_status("Cannot save the nested G-code: fix the errors listed", true);
+            return;
+        }
+        let stem = std::path::Path::new(&self.step_gcode_path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "step".into());
+        let Some(path) = rfd::FileDialog::new().set_title("Save nested G-code").add_filter("G-code", &["nc", "ngc", "gcode", "tap"]).set_file_name(format!("{stem}-nest.nc")).save_file() else { return };
+        match std::fs::write(&path, &self.nest_gcode) {
+            Ok(()) => self.set_status(format!("Saved nested G-code ({} copies) to {}", self.job.nest.copies.len(), path.display()), false),
+            Err(e) => self.set_status(format!("Error saving {}: {e}", path.display()), true),
+        }
     }
 
     fn save_gcode(&mut self) {
@@ -507,9 +665,10 @@ impl StepCamApp {
             self.step_view.ui(ui, &self.step_toolpath, None);
             return;
         };
-        let stock = self.job.step.stock.bounds(model.min, model.max);
+        let stock = self.job.step.stock_box(model.min, model.max);
+        let stock_edges = self.job.step.stock_shape.clone().filter(|_| self.job.step.stock_model.is_set());
         let omit_faces: Vec<usize> = self.job.step.ops.iter().filter(|o| o.enabled && matches!(o.kind, OpKind::Omit(_))).flat_map(|o| o.faces()).collect();
-        let viz = ModelViz { model: &model, sel_edges: &self.sel.edges, sel_faces: &self.sel.faces, omit_faces: &omit_faces, tabs: &tabs, stock: Some(stock), origin: Some(self.job.step.origin.at) };
+        let viz = ModelViz { model: &model, sel_edges: &self.sel.edges, sel_faces: &self.sel.faces, omit_faces: &omit_faces, tabs: &tabs, stock: Some(stock), stock_edges: stock_edges.as_ref().map(|s| &s.edges[..]), origin: Some(self.job.step.origin.at) };
         let out = self.step_view.ui(ui, &self.step_toolpath, Some(&viz));
         // Ctrl / Cmd + click adds cylindrical holes to the selection (or
         // removes them); right-clicking a selected hole keeps the selection
@@ -612,9 +771,74 @@ impl StepCamApp {
                 .on_hover_text("Measured from the highest point of the stock or the part, whichever is higher");
             ui.weak(format!("= rapid plane Z{}", gcode::fmt(rapid_z)));
         });
-        let st = &mut self.job.step.stock;
+        let mut use_model = self.job.step.stock_model.is_set();
+        let mut browse = false;
         ui.horizontal(|ui| {
             ui.label("Stock");
+            let was = use_model;
+            ui.selectable_value(&mut use_model, false, "Box").on_hover_text("A block sized from the part's bounding box");
+            ui.selectable_value(&mut use_model, true, "STEP model")
+                .on_hover_text("A STEP file as the stock - a casting, or the part from an earlier setup. Roughing only cuts where it has stock and the simulator starts from its shape.");
+            if use_model && !was {
+                browse = true;
+                use_model = false;
+            } else if !use_model && was {
+                self.job.step.stock_model = Default::default();
+            }
+        });
+        if browse {
+            self.import_stock_model();
+            return;
+        }
+        if use_model {
+            let shape = self.job.step.stock_shape.clone();
+            let issues = model_box.map(|(min, max)| self.job.step.stock_issues(min, max)).unwrap_or_default();
+            let sm = &mut self.job.step.stock_model;
+            let mut centre = false;
+            ui.horizontal(|ui| {
+                let name = std::path::Path::new(&sm.path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                ui.label(format!("📦 {name}")).on_hover_text(&sm.path);
+                if ui.button("Change…").clicked() {
+                    browse = true;
+                }
+                ui.label("Shift").on_hover_text("Moves the stock model after the part's placement (it is in the same coordinates as the part's STEP file)");
+                for (k, a) in ["X", "Y", "Z"].iter().enumerate() {
+                    ui.add(egui::DragValue::new(&mut sm.shift[k]).speed(0.1).max_decimals(3).prefix(format!("{a} ")).suffix(" mm"));
+                }
+                centre = ui.button("Centre on part").on_hover_text("Shift the stock model so it is centred on the part in X and Y and its base is level with the part's").clicked();
+                match (&shape, model_box) {
+                    (Some(s), Some(_)) => {
+                        ui.weak(format!(
+                            "= {} x {} x {}  (Z{} to Z{})",
+                            gcode::fmt(s.max[0] - s.min[0]),
+                            gcode::fmt(s.max[1] - s.min[1]),
+                            gcode::fmt(s.max[2] - s.min[2]),
+                            gcode::fmt(s.min[2]),
+                            gcode::fmt(s.max[2])
+                        ));
+                        for e in &issues {
+                            ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {e}"));
+                        }
+                    }
+                    (None, _) => {
+                        ui.colored_label(ui.visuals().warn_fg_color, "⚠ not loaded");
+                    }
+                    _ => {}
+                }
+            });
+            if let (true, Some(s), Some((min, max))) = (centre, &shape, model_box) {
+                let sm = &mut self.job.step.stock_model;
+                sm.shift[0] += (min[0] + max[0]) / 2.0 - (s.min[0] + s.max[0]) / 2.0;
+                sm.shift[1] += (min[1] + max[1]) / 2.0 - (s.min[1] + s.max[1]) / 2.0;
+                sm.shift[2] += min[2] - s.min[2];
+            }
+            if browse {
+                self.import_stock_model();
+            }
+            return;
+        }
+        let st = &mut self.job.step.stock;
+        ui.horizontal(|ui| {
             let hover = if st.offset { "Added to the part's bounding box (X/Y split over both sides, Z on top)" } else { "Absolute stock size" };
             for (a, v) in [("X", &mut st.x), ("Y", &mut st.y), ("Z", &mut st.z)] {
                 ui.label(a);
@@ -989,12 +1213,14 @@ impl eframe::App for StepCamApp {
                 ui.heading("stepCAM");
                 ui.separator();
                 ui.selectable_value(&mut self.tab, Tab::StepMilling, "Step Milling");
+                ui.selectable_value(&mut self.tab, Tab::Nest, "Nest");
                 ui.selectable_value(&mut self.tab, Tab::Simulator, "Simulator");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Tools & Settings");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("❓ Help").on_hover_text("User guide for this tab (F1)").clicked() {
                         self.help.open_at(match self.tab {
                             Tab::StepMilling => "Step Milling tab",
+                            Tab::Nest => "Nest tab",
                             Tab::Simulator => "Simulator tab",
                             Tab::Settings => "Tools & Settings tab",
                         });
@@ -1012,6 +1238,19 @@ impl eframe::App for StepCamApp {
             .show(ctx, |ui| {
                 if self.tab == Tab::Simulator {
                     self.sim.code_panel(ui);
+                    return;
+                }
+                if self.tab == Tab::Nest {
+                    let code = &self.nest_gcode;
+                    ui.horizontal(|ui| {
+                        ui.heading("Nested G-code");
+                        if ui.add_enabled(!code.is_empty(), egui::Button::new("📋 Copy")).clicked() {
+                            ui.output_mut(|o| o.copied_text = code.clone());
+                        }
+                    });
+                    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut code.as_str()).id_source("nest_gcode_text").code_editor().desired_width(f32::INFINITY));
+                    });
                     return;
                 }
                 let (code, view) = (&self.step_gcode, &mut self.step_view);
@@ -1042,14 +1281,27 @@ impl eframe::App for StepCamApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::StepMilling => self.step_milling_tab(ui),
+            Tab::Nest => self.nest_tab(ui),
             Tab::Simulator => {
+                // the nest's program when simulating it (or to offer it)
+                if self.sim.source == simview::Source::Nest || self.nest_generated_from.is_some() {
+                    self.regenerate_nest_if_changed();
+                }
                 let step_stock = self.stock_box();
+                let nest_stock = step_stock.map(|s| self.job.nest.sheet(s));
+                let nest_origin = step_stock.map_or([0.0; 3], |s| self.job.nest.origin_at(&self.job.step.origin, s));
+                let nest_places = step_stock.map(|s| self.job.nest.placements(s)).unwrap_or_default();
                 let inp = simview::Inputs {
                     step_code: if self.step_errors.is_empty() { &self.step_gcode } else { "" },
                     settings: &self.job.settings,
                     model: self.step_model.as_ref(),
                     step_stock,
                     step_origin: self.job.step.origin.at,
+                    nest_code: if self.nest_errors.is_empty() { &self.nest_gcode } else { "" },
+                    nest_stock,
+                    nest_origin,
+                    nest_copies: &nest_places,
+                    stock_tris: self.job.step.stock_shape.as_ref().filter(|_| self.job.step.stock_model.is_set()).map(|s| &s.tris[..]),
                 };
                 self.sim.ui(ui, &inp);
             }
@@ -1915,6 +2167,17 @@ fn strategy_name(s: Strategy) -> &'static str {
     }
 }
 
+/// Climb / conventional picker (a grid row).
+fn dir_combo(ui: &mut egui::Ui, id: impl std::hash::Hash, label: &str, d: &mut stepmill::CutDir, hover: &str) {
+    ui.label(label).on_hover_text(hover);
+    egui::ComboBox::from_id_salt(id).selected_text(d.name()).show_ui(ui, |ui| {
+        for k in [stepmill::CutDir::Climb, stepmill::CutDir::Conventional] {
+            ui.selectable_value(d, k, k.name());
+        }
+    });
+    ui.end_row();
+}
+
 /// Facing pattern picker (a grid row).
 fn facing_combo(ui: &mut egui::Ui, id: impl std::hash::Hash, label: &str, p: &mut stepmill::FacingPattern) {
     ui.label(label).on_hover_text(if label == "Facing" { "Pattern of the facing pass over stock taller than the part" } else { "How the facing pass covers the area" });
@@ -2003,13 +2266,16 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
             ui.label("Tool position");
             egui::ComboBox::from_id_salt(("side", i)).selected_text(p.side.name()).show_ui(ui, |ui| {
                 ui.selectable_value(&mut p.side, ProfileSide::Center, "on centre line").on_hover_text("Tool centre follows the edges");
-                for (side, hover) in [(ProfileSide::Inside, "Tool inside the loop, edge of cut on the edges (CCW, climb)"), (ProfileSide::Outside, "Tool outside the loop, edge of cut on the edges (CW, climb)")] {
+                for (side, hover) in [(ProfileSide::Inside, "Tool inside the loop, edge of cut on the edges"), (ProfileSide::Outside, "Tool outside the loop, edge of cut on the edges")] {
                     ui.add_enabled_ui(p.closed, |ui| {
                         ui.selectable_value(&mut p.side, side, side.name()).on_hover_text(hover).on_disabled_hover_text("Only for closed loops of edges");
                     });
                 }
             });
             ui.end_row();
+            if p.closed && p.side != ProfileSide::Center {
+                dir_combo(ui, ("profile_dir", i), "Direction", &mut p.direction, "One lap per layer, always this way round: climb = CW outside the loop, CCW inside it (M3)");
+            }
             num(ui, "Feed", &mut p.feed, 1.0, " mm/min", "");
             num(ui, "Speed", &mut p.speed, 10.0, " rpm", "");
             num(ui, "Ramp angle", &mut p.ramp_angle, 0.1, "°", "Ramp down along the path at this angle");
@@ -2071,6 +2337,9 @@ fn op_params(ui: &mut egui::Ui, i: usize, kind: &mut OpKind, cutters: &[Cutter],
                 .on_hover_text("Pockets and steps (anything with a face below) are always cleared.\nTicked: holes that go right through the part are cleared too.\nUnticked: through holes are only profiled.");
             ui.end_row();
             facing_combo(ui, ("rough_facing", i), "Facing", &mut r.facing);
+            if r.strategy == Strategy::Standard && !r.inside_only {
+                dir_combo(ui, ("rough_outside_dir", i), "Outside", &mut r.outside_dir, "The pass round the part's outside walls: one per layer, always this way round (climb = CW, M3)");
+            }
             ui.label("Inside only");
             ui.checkbox(&mut r.inside_only, "").on_hover_text(
                 "No cutting round the part's outside profile: the clearing stays within the part's outline seen from above. \
@@ -2628,5 +2897,42 @@ mod regen_tests {
         }
         assert!(app.regenerate_step_if_changed());
         assert_ne!(app.step_gcode, before);
+    }
+}
+
+#[cfg(test)]
+mod stock_model_tests {
+    use super::*;
+
+    #[test]
+    fn the_stock_model_loads_follows_the_placement_and_drives_the_stock() {
+        let mut app = StepCamApp::default();
+        let m = step::parse_model(include_str!("../testdata/pocket_block.step")).unwrap();
+        app.step_model = Some(m.clone());
+        app.step_raw = Some(m);
+        app.add_rough_op();
+        app.regenerate_step_if_changed();
+        // the part's own file as the stock, 2 mm up
+        app.job.step.stock_model = stock::StockModel { path: "testdata/pocket_block.step".into(), shift: [0.0, 0.0, 2.0] };
+        app.regenerate_step_if_changed();
+        let s = app.job.step.stock_shape.clone().expect("loaded");
+        assert_eq!(app.stock_box(), Some((s.min, s.max)));
+        assert!((s.max[2] - 2.0).abs() < 1e-9);
+        // ops starting at the stock top follow it; the rough starts there
+        let OpKind::Rough(r) = &app.job.step.ops[0].kind else { unreachable!() };
+        assert!((r.start_z - 2.0).abs() < 1e-9, "{}", r.start_z);
+        assert!(app.step_errors.is_empty(), "{:?}", app.step_errors);
+        // moving the part moves the stock with it
+        let pl = app.job.step.placement.translated([0.0, 0.0, -5.0]);
+        app.apply_placement(pl, "moved");
+        app.regenerate_step_if_changed();
+        assert!((app.stock_box().unwrap().1[2] + 3.0).abs() < 1e-9);
+        // a missing file: an error, the box again
+        app.job.step.stock_model.path = "testdata/no-such.step".into();
+        app.regenerate_step_if_changed();
+        assert!(app.status_is_error && app.job.step.stock_shape.is_none());
+        app.job.step.stock_model = Default::default();
+        app.regenerate_step_if_changed();
+        assert_eq!(app.stock_box(), Some(app.job.step.stock.bounds(app.step_model.as_ref().unwrap().min, app.step_model.as_ref().unwrap().max)));
     }
 }

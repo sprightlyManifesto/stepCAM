@@ -11,6 +11,8 @@
 //! ```text
 //! { "step": "part.step",
 //!   "stock": {"x": 4, "y": 4, "z": 2, "offset": true},      // optional
+//!   "stock_model": {"path": "casting.step", "shift": [0, 0, 0]}, // optional: a STEP
+//!             // model as the stock (same coordinates as "step"; replaces the box)
 //!   "placement": {"rot": [[..],[..],[..]], "offset": [..]},  // optional
 //!   "rapid_above": 10,                                       // optional
 //!   "origin": {"xy": "bottom_left", "z": "stock_top"},       // optional program zero:
@@ -40,6 +42,8 @@ struct Spec {
     step: String,
     #[serde(default)]
     stock: Option<Stock>,
+    #[serde(default)]
+    stock_model: Option<crate::stock::StockModel>,
     #[serde(default)]
     placement: Option<step::Placement>,
     #[serde(default)]
@@ -170,13 +174,22 @@ fn run(spec: &Spec) -> (Value, i32) {
     if let Some(r) = spec.rapid_above {
         job.rapid_above = r;
     }
-    let stock = job.stock.bounds(model.min, model.max);
+    if let Some(sm) = spec.stock_model.as_ref().filter(|m| m.is_set()) {
+        let shape = step::load(&sm.path).and_then(|m| crate::stock::StockShape::new(&m, &placement, sm.shift));
+        match shape {
+            Ok(sh) => job.stock_shape = Some(std::sync::Arc::new(sh)),
+            Err(e) => return fail(vec![format!("stock model {}: {e}", sm.path)]),
+        }
+        let path = std::fs::canonicalize(&sm.path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| sm.path.clone());
+        job.stock_model = crate::stock::StockModel { path, shift: sm.shift };
+    }
+    let stock = job.stock_box(model.min, model.max);
     let stock_top = stock.1[2];
     if let Some(o) = spec.origin {
         job.origin = o;
     }
     job.origin.resolve(stock.0, stock.1);
-    let mut warnings: Vec<String> = job.stock.issues(model.min, model.max);
+    let mut warnings: Vec<String> = job.stock_issues(model.min, model.max);
 
     let mut errors = vec![];
     for (i, o) in spec.ops.iter().enumerate() {
@@ -236,7 +249,7 @@ fn run(spec: &Spec) -> (Value, i32) {
         report["gcode_text"] = json!(code);
     }
     if let Some(p) = &spec.job_out {
-        let full = Job { groups: vec![], settings: settings.clone(), step: job.clone() };
+        let full = Job { groups: vec![], settings: settings.clone(), step: job.clone(), ..Default::default() };
         let text = serde_json::to_string_pretty(&full).unwrap_or_default();
         if let Err(e) = std::fs::write(p, text) {
             return fail(vec![format!("cannot write {p}: {e}")]);
@@ -244,17 +257,21 @@ fn run(spec: &Spec) -> (Value, i32) {
         report["job"] = json!(p);
     }
     if let Some(s) = &spec.simulate {
-        report["simulation"] = simulate(&code, &gen_settings, stock, &model, job.origin.at, s);
+        let tris = job.stock_shape.as_ref().map(|s| &s.tris[..]);
+        report["simulation"] = simulate(&code, &gen_settings, stock, tris, &model, job.origin.at, s);
     }
     (report, 0)
 }
 
 /// Run the program through the simulator to the end.
-fn simulate(code: &str, s: &Settings, stock: ([f64; 3], [f64; 3]), model: &step::Model, origin: [f64; 3], spec: &SimSpec) -> Value {
+fn simulate(code: &str, s: &Settings, stock: ([f64; 3], [f64; 3]), stock_tris: Option<&[[[f64; 3]; 3]]>, model: &step::Model, origin: [f64; 3], spec: &SimSpec) -> Value {
     // the program is relative to the origin: simulate it where it cuts
     let mut prog = sim::Program::parse(code, s);
     prog.translate(origin);
     let mut sm = sim::Sim::new(prog, stock.0, stock.1, spec.detail.clamp(20, 2000));
+    if let Some(t) = stock_tris {
+        sm = sm.with_stock(t);
+    }
     while !sm.seek(f64::INFINITY, std::time::Duration::from_secs(3600)) {}
     let part = sm.map.surface_of(sim::top_tris(model));
     let tol = spec.tolerance as f32;
@@ -547,7 +564,7 @@ fn enum_name(key: &str, v: &Value) -> Value {
     let Some(s) = v.as_str() else { return v.clone() };
     match key {
         // "square_spiral" / "square spiral" -> SquareSpiral
-        "strategy" | "entry" | "side" | "h_align" | "v_align" | "pattern" | "facing" | "face_pattern" | "rough_strategy" => json!(s
+        "strategy" | "entry" | "side" | "h_align" | "v_align" | "pattern" | "facing" | "face_pattern" | "rough_strategy" | "outside_dir" | "direction" => json!(s
             .split(['_', ' ', '-'])
             .map(|w| {
                 let mut c = w.chars();
